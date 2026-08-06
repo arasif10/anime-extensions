@@ -54,3 +54,9 @@ fun File.eachDir(block: (File) -> Unit) {
         }
     }
 }
+
+gradle.rootProject {
+    tasks.register("assembleRelease") {
+        dependsOn(subprojects.map { sub -> sub.tasks.matching { it.name == "assembleDebug" } })
+    }
+}
