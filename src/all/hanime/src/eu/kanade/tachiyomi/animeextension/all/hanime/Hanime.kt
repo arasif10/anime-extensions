@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.all.hanime
 
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
+import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
@@ -24,13 +25,20 @@ class Hanime : ParsedAnimeHttpSource() {
     override val supportsLatest = true
 
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
-        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .add("User-Agent", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36")
         .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+        .add("Accept-Language", "en-US,en;q=0.9")
+        .add("Origin", "https://hanime.tv")
         .add("Referer", "$baseUrl/")
+
+    private fun playerVideoHeaders(): Headers = headers.newBuilder()
+        .set("Referer", "https://player.hanime.tv/")
+        .set("Origin", "https://player.hanime.tv")
+        .build()
 
     // ============================== Popular Anime ==============================
     override fun popularAnimeRequest(page: Int): Request {
-        return GET("$baseUrl/browse/trending", headers)
+        return GET("$baseUrl/browse/trending?page=$page", headers)
     }
 
     override fun popularAnimeSelector(): String = "a[href*=/videos/hentai/]"
@@ -52,29 +60,53 @@ class Hanime : ParsedAnimeHttpSource() {
         }
     }
 
-    override fun popularAnimeNextPageSelector(): String? = null
+    override fun popularAnimeNextPageSelector(): String? = popularAnimeSelector()
+
+    override fun popularAnimeParse(response: Response): AnimesPage {
+        val document = Jsoup.parse(response.body.string())
+        val animeList = document.select(popularAnimeSelector()).map { element ->
+            popularAnimeFromElement(element)
+        }.distinctBy { it.url }
+
+        val hasNextPage = animeList.size >= 12
+        return AnimesPage(animeList, hasNextPage)
+    }
 
     // ============================== Latest Updates ==============================
     override fun latestUpdatesRequest(page: Int): Request {
-        return GET("$baseUrl/", headers)
+        return GET("$baseUrl/browse/seasons?page=$page", headers)
     }
 
     override fun latestUpdatesSelector(): String = popularAnimeSelector()
 
     override fun latestUpdatesFromElement(element: Element): SAnime = popularAnimeFromElement(element)
 
-    override fun latestUpdatesNextPageSelector(): String? = null
+    override fun latestUpdatesNextPageSelector(): String? = popularAnimeSelector()
+
+    override fun latestUpdatesParse(response: Response): AnimesPage {
+        val document = Jsoup.parse(response.body.string())
+        val animeList = document.select(latestUpdatesSelector()).map { element ->
+            latestUpdatesFromElement(element)
+        }.distinctBy { it.url }
+
+        val hasNextPage = animeList.size >= 12
+        return AnimesPage(animeList, hasNextPage)
+    }
 
     // ============================== Search ==============================
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        return GET("$baseUrl/browse/trending", headers)
+        return GET("$baseUrl/browse/trending?page=$page", headers)
     }
 
     override fun searchAnimeSelector(): String = popularAnimeSelector()
 
     override fun searchAnimeFromElement(element: Element): SAnime = popularAnimeFromElement(element)
 
-    override fun searchAnimeNextPageSelector(): String? = null
+    override fun searchAnimeNextPageSelector(): String? = popularAnimeSelector()
+
+    override fun searchAnimeParse(response: Response): AnimesPage {
+        return popularAnimeParse(response)
+    }
 
     // ============================== Details ==============================
     override fun animeDetailsParse(document: Document): SAnime {
@@ -115,7 +147,7 @@ class Hanime : ParsedAnimeHttpSource() {
     override fun videoFromElement(element: Element): Video {
         val videoUrl = element.attr("src")
         val quality = if (element.tagName() == "iframe") "Embed Server" else "720p"
-        return Video(videoUrl, quality, videoUrl)
+        return Video(videoUrl, quality, videoUrl, headers = playerVideoHeaders())
     }
 
     override fun videoUrlParse(document: Document): String {
@@ -125,25 +157,29 @@ class Hanime : ParsedAnimeHttpSource() {
     override fun videoListParse(response: Response): List<Video> {
         val document = Jsoup.parse(response.body.string())
         val videoList = mutableListOf<Video>()
+        val pHeaders = playerVideoHeaders()
 
+        // 1. Check direct video source elements
         document.select("video source").forEach { element: Element ->
             val src = element.attr("src")
             if (src.isNotBlank()) {
-                videoList.add(Video(src, "720p", src))
+                videoList.add(Video(src, "720p", src, headers = pHeaders))
             }
         }
 
+        // 2. Check iframe embeds
         document.select("iframe").forEach { element: Element ->
             val src = element.attr("src")
             if (src.isNotBlank()) {
-                videoList.add(Video(src, "Embed Server", src))
+                videoList.add(Video(src, "Embed Server", src, headers = pHeaders))
             }
         }
 
+        // 3. Fallback: Player Embed URL with player headers
         val slug = response.request.url.encodedPath.substringAfterLast("/").trim()
         if (slug.isNotBlank()) {
             val playerUrl = "https://player.hanime.tv/?id=$slug"
-            videoList.add(Video(playerUrl, "Hanime Web Player", playerUrl))
+            videoList.add(Video(playerUrl, "Hanime Web Stream", playerUrl, headers = pHeaders))
         }
 
         return videoList
