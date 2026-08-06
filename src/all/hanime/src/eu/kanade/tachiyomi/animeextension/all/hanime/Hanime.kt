@@ -1,4 +1,4 @@
-package eu.kanade.tachiyomi.animeextension.all.hanime
+﻿package eu.kanade.tachiyomi.animeextension.all.hanime
 
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
