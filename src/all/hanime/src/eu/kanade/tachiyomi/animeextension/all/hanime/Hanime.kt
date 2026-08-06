@@ -56,7 +56,7 @@ class Hanime : ParsedAnimeHttpSource() {
 
     // ============================== Latest Updates ==============================
     override fun latestUpdatesRequest(page: Int): Request {
-        return GET("$baseUrl/browse/random", headers)
+        return GET("$baseUrl/", headers)
     }
 
     override fun latestUpdatesSelector(): String = popularAnimeSelector()
@@ -140,21 +140,10 @@ class Hanime : ParsedAnimeHttpSource() {
             }
         }
 
-        if (videoList.isEmpty()) {
-            document.select("script[type=application/ld+json]").forEach { script ->
-                val json = script.data()
-                if (json.contains("embedUrl")) {
-                    val embedUrl = json.substringAfter("\"embedUrl\":\"").substringBefore("\"")
-                    if (embedUrl.isNotBlank()) {
-                        videoList.add(Video(embedUrl, "Web Player", embedUrl))
-                    }
-                }
-            }
-        }
-
-        if (videoList.isEmpty()) {
-            val pageUrl = response.request.url.toString()
-            videoList.add(Video(pageUrl, "Web Stream", pageUrl))
+        val slug = response.request.url.encodedPath.substringAfterLast("/").trim()
+        if (slug.isNotBlank()) {
+            val playerUrl = "https://player.hanime.tv/?id=$slug"
+            videoList.add(Video(playerUrl, "Hanime Web Player", playerUrl))
         }
 
         return videoList
