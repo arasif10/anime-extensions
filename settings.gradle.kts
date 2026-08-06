@@ -8,17 +8,21 @@ File(rootDir, "lib").eachDir { include("lib:${it.name}") }
 // Load all modules under /lib-multisrc
 File(rootDir, "lib-multisrc").eachDir { include("lib-multisrc:${it.name}") }
 
-val ciChunkSize = System.getenv("CI_CHUNK_SIZE")
-val ciChunkNum = System.getenv("CI_CHUNK_NUM")
+if (System.getenv("CI") != "true") {
+    // Local development (full project build)
 
-if (System.getenv("CI") != "true" || ciChunkSize == null || ciChunkNum == null) {
-    // Local development or simple CI (full project build)
+    /**
+     * Add or remove modules to load as needed for local development here.
+     */
     loadAllIndividualExtensions()
+    // loadIndividualExtension("all", "jellyfin")
 } else {
-    // Running in chunked CI
-    val chunkSize = ciChunkSize.toInt()
-    val chunk = ciChunkNum.toInt()
+    // Running in CI (GitHub Actions)
 
+    val chunkSize = System.getenv("CI_CHUNK_SIZE")?.toIntOrNull() ?: Int.MAX_VALUE
+    val chunk = System.getenv("CI_CHUNK_NUM")?.toIntOrNull() ?: 0
+
+    // Loads individual extensions
     File(rootDir, "src").getChunk(chunk, chunkSize)?.forEach {
         loadIndividualExtension(it.parentFile.name, it.name)
     }
@@ -31,14 +35,15 @@ fun loadAllIndividualExtensions() {
         }
     }
 }
-
 fun loadIndividualExtension(lang: String, name: String) {
     include("src:$lang:$name")
 }
 
 fun File.getChunk(chunk: Int, chunkSize: Int): List<File>? {
     return listFiles()
+        // Lang folder
         ?.filter { it.isDirectory }
+        // Extension subfolders
         ?.mapNotNull { dir -> dir.listFiles()?.filter { it.isDirectory } }
         ?.flatten()
         ?.sortedBy { it.name }
@@ -52,11 +57,5 @@ fun File.eachDir(block: (File) -> Unit) {
         if (file.isDirectory && file.name != ".gradle" && file.name != "build") {
             block(file)
         }
-    }
-}
-
-gradle.rootProject {
-    tasks.register("assembleRelease") {
-        dependsOn(subprojects.map { sub -> sub.tasks.matching { it.name == "assembleDebug" } })
     }
 }
