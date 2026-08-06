@@ -28,6 +28,7 @@ class Hanime : ParsedAnimeHttpSource() {
         .add("User-Agent", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36")
         .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
         .add("Accept-Language", "en-US,en;q=0.9")
+        .add("Cookie", "inter=1")
         .add("Origin", "https://hanime.tv")
         .add("Referer", "$baseUrl/")
 
