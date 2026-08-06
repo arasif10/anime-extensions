@@ -32,7 +32,6 @@ class Hanime : AnimeHttpSource() {
 
     private val json: Json by injectLazy()
 
-    // Fixed: removed dead htv-services.workers.dev, now uses hanime.tv directly
     private val apiBaseUrl = "https://hanime.tv/api/v8"
     private val searchApiUrl = "https://hanime.tv/api/v8/search"
 
