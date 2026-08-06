@@ -14,7 +14,6 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Headers
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
@@ -31,17 +30,16 @@ class Hanime : AnimeHttpSource() {
 
     override val supportsLatest = true
 
-    override val client: OkHttpClient = network.client
-
     private val json: Json by injectLazy()
 
+    // Fixed: removed dead htv-services.workers.dev, now uses hanime.tv directly
     private val apiBaseUrl = "https://hanime.tv/api/v8"
     private val searchApiUrl = "https://hanime.tv/api/v8/search"
 
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .add("X-Signature-Version", "web2")
-        .add("Referer", "/")
+        .add("Referer", "$baseUrl/")
 
     // ============================== Popular Anime ==============================
     override fun popularAnimeRequest(page: Int): Request {
@@ -53,7 +51,7 @@ class Hanime : AnimeHttpSource() {
                 "blacklist": [],
                 "order_by": "views",
                 "ordering": "desc",
-                "page": 
+                "page": ${page - 1}
             }
         """.trimIndent()
         val body = payload.toRequestBody("application/json".toMediaType())
@@ -74,7 +72,7 @@ class Hanime : AnimeHttpSource() {
                 "blacklist": [],
                 "order_by": "created_at_unix",
                 "ordering": "desc",
-                "page": 
+                "page": ${page - 1}
             }
         """.trimIndent()
         val body = payload.toRequestBody("application/json".toMediaType())
@@ -89,13 +87,13 @@ class Hanime : AnimeHttpSource() {
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
         val payload = """
             {
-                "search_text": "",
+                "search_text": "$query",
                 "tags": [],
                 "brands": [],
                 "blacklist": [],
                 "order_by": "created_at_unix",
                 "ordering": "desc",
-                "page": 
+                "page": ${page - 1}
             }
         """.trimIndent()
         val body = payload.toRequestBody("application/json".toMediaType())
@@ -125,7 +123,7 @@ class Hanime : AnimeHttpSource() {
             val obj = element.jsonObject
             val anime = SAnime.create().apply {
                 val slug = obj["slug"]?.jsonPrimitive?.content ?: ""
-                url = "/hentai-videos/"
+                url = "/hentai-videos/$slug"
                 title = obj["name"]?.jsonPrimitive?.content ?: ""
                 thumbnail_url = obj["cover_url"]?.jsonPrimitive?.content ?: obj["poster_url"]?.jsonPrimitive?.content
             }
@@ -142,7 +140,7 @@ class Hanime : AnimeHttpSource() {
     // ============================== Details ==============================
     override fun animeDetailsRequest(anime: SAnime): Request {
         val slug = anime.url.substringAfterLast("/")
-        return GET("/video?id=", headers)
+        return GET("$apiBaseUrl/video?id=$slug", headers)
     }
 
     override fun animeDetailsParse(response: Response): SAnime {
@@ -197,7 +195,7 @@ class Hanime : AnimeHttpSource() {
         val episode = SEpisode.create().apply {
             name = "Episode 1"
             episode_number = 1f
-            url = if (slug.isNotEmpty()) "/hentai-videos/" else response.request.url.encodedPath
+            url = if (slug.isNotEmpty()) "/hentai-videos/$slug" else response.request.url.encodedPath
         }
 
         return listOf(episode)
@@ -206,7 +204,7 @@ class Hanime : AnimeHttpSource() {
     // ============================== Video Streams ==============================
     override fun videoListRequest(episode: SEpisode): Request {
         val slug = episode.url.substringAfterLast("/")
-        return GET("/video?id=", headers)
+        return GET("$apiBaseUrl/video?id=$slug", headers)
     }
 
     override fun videoListParse(response: Response): List<Video> {
@@ -232,7 +230,7 @@ class Hanime : AnimeHttpSource() {
                 val height = streamObj["height"]?.jsonPrimitive?.content ?: "720"
 
                 if (streamUrl.isNotBlank()) {
-                    val quality = " - p"
+                    val quality = "$serverName - ${height}p"
                     videoList.add(Video(streamUrl, quality, streamUrl))
                 }
             }
