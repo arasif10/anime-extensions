@@ -1,26 +1,19 @@
 package eu.kanade.tachiyomi.animeextension.all.hanime
 
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
-import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
-import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
+import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Headers
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.jsoup.Jsoup
-import uy.kohesive.injekt.injectLazy
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 
-class Hanime : AnimeHttpSource() {
+class Hanime : ParsedAnimeHttpSource() {
 
     override val name = "Hanime"
 
@@ -30,211 +23,140 @@ class Hanime : AnimeHttpSource() {
 
     override val supportsLatest = true
 
-    private val json: Json by injectLazy()
-
-    private val apiBaseUrl = "https://hanime.tv/api/v8"
-    private val searchApiUrl = "https://hanime.tv/api/v8/search"
-
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-        .add("X-Signature-Version", "web2")
+        .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
         .add("Referer", "$baseUrl/")
 
     // ============================== Popular Anime ==============================
     override fun popularAnimeRequest(page: Int): Request {
-        val payload = """
-            {
-                "search_text": "",
-                "tags": [],
-                "brands": [],
-                "blacklist": [],
-                "order_by": "views",
-                "ordering": "desc",
-                "page": ${page - 1}
-            }
-        """.trimIndent()
-        val body = payload.toRequestBody("application/json".toMediaType())
-        return POST(searchApiUrl, headers, body)
+        return GET("$baseUrl/browse/trending", headers)
     }
 
-    override fun popularAnimeParse(response: Response): AnimesPage {
-        return parseSearchJson(response.body.string())
+    override fun popularAnimeSelector(): String = "a[href*=/videos/hentai/]"
+
+    override fun popularAnimeFromElement(element: Element): SAnime {
+        return SAnime.create().apply {
+            val href = element.attr("href")
+            url = if (href.startsWith("http")) {
+                "/" + href.substringAfter("/videos/hentai/")
+            } else if (href.startsWith("/videos/hentai/")) {
+                href
+            } else {
+                "/videos/hentai/" + href.trimStart('/')
+            }
+            title = element.attr("title").ifEmpty {
+                element.selectFirst("img")?.attr("alt") ?: ""
+            }.replace("Watch ", "").replace(" hentai stream online HD 1080p, 720p", "").trim()
+            thumbnail_url = element.selectFirst("img")?.attr("src")
+        }
     }
+
+    override fun popularAnimeNextPageSelector(): String? = null
 
     // ============================== Latest Updates ==============================
     override fun latestUpdatesRequest(page: Int): Request {
-        val payload = """
-            {
-                "search_text": "",
-                "tags": [],
-                "brands": [],
-                "blacklist": [],
-                "order_by": "created_at_unix",
-                "ordering": "desc",
-                "page": ${page - 1}
-            }
-        """.trimIndent()
-        val body = payload.toRequestBody("application/json".toMediaType())
-        return POST(searchApiUrl, headers, body)
+        return GET("$baseUrl/browse/random", headers)
     }
 
-    override fun latestUpdatesParse(response: Response): AnimesPage {
-        return parseSearchJson(response.body.string())
-    }
+    override fun latestUpdatesSelector(): String = popularAnimeSelector()
+
+    override fun latestUpdatesFromElement(element: Element): SAnime = popularAnimeFromElement(element)
+
+    override fun latestUpdatesNextPageSelector(): String? = null
 
     // ============================== Search ==============================
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val payload = """
-            {
-                "search_text": "$query",
-                "tags": [],
-                "brands": [],
-                "blacklist": [],
-                "order_by": "created_at_unix",
-                "ordering": "desc",
-                "page": ${page - 1}
-            }
-        """.trimIndent()
-        val body = payload.toRequestBody("application/json".toMediaType())
-        return POST(searchApiUrl, headers, body)
+        return GET("$baseUrl/browse/trending", headers)
     }
 
-    override fun searchAnimeParse(response: Response): AnimesPage {
-        return parseSearchJson(response.body.string())
-    }
+    override fun searchAnimeSelector(): String = popularAnimeSelector()
 
-    private fun parseSearchJson(jsonString: String): AnimesPage {
-        val parsed = json.parseToJsonElement(jsonString).jsonObject
-        val hitsRaw = parsed["hits"] ?: return AnimesPage(emptyList(), false)
-        val animeList = mutableListOf<SAnime>()
+    override fun searchAnimeFromElement(element: Element): SAnime = popularAnimeFromElement(element)
 
-        val hitsArray = try {
-            if (hitsRaw.jsonPrimitive.isString) {
-                json.parseToJsonElement(hitsRaw.jsonPrimitive.content).jsonArray
-            } else {
-                hitsRaw.jsonArray
-            }
-        } catch (e: Exception) {
-            null
-        }
-
-        hitsArray?.forEach { element ->
-            val obj = element.jsonObject
-            val anime = SAnime.create().apply {
-                val slug = obj["slug"]?.jsonPrimitive?.content ?: ""
-                url = "/hentai-videos/$slug"
-                title = obj["name"]?.jsonPrimitive?.content ?: ""
-                thumbnail_url = obj["cover_url"]?.jsonPrimitive?.content ?: obj["poster_url"]?.jsonPrimitive?.content
-            }
-            animeList.add(anime)
-        }
-
-        val page = parsed["page"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
-        val nbPages = parsed["nbPages"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
-        val hasNextPage = (page + 1) < nbPages
-
-        return AnimesPage(animeList, hasNextPage)
-    }
+    override fun searchAnimeNextPageSelector(): String? = null
 
     // ============================== Details ==============================
-    override fun animeDetailsRequest(anime: SAnime): Request {
-        val slug = anime.url.substringAfterLast("/")
-        return GET("$apiBaseUrl/video?id=$slug", headers)
-    }
-
-    override fun animeDetailsParse(response: Response): SAnime {
-        val body = response.body.string()
-
-        if (body.trimStart().startsWith("<")) {
-            return parseAnimeDetailsFromHtml(body)
-        }
-
-        val jsonObj = json.parseToJsonElement(body).jsonObject
-        val videoObj = jsonObj["hentai_video"]?.jsonObject ?: return SAnime.create()
-
+    override fun animeDetailsParse(document: Document): SAnime {
         return SAnime.create().apply {
-            title = videoObj["name"]?.jsonPrimitive?.content ?: ""
-            thumbnail_url = videoObj["poster_url"]?.jsonPrimitive?.content
-            description = videoObj["description"]?.jsonPrimitive?.content?.let {
-                Jsoup.parse(it).text()
-            }
-            author = videoObj["brand"]?.jsonPrimitive?.content
-            genre = videoObj["hentai_tags"]?.jsonArray?.joinToString {
-                it.jsonObject["name"]?.jsonPrimitive?.content ?: ""
-            }
-            status = SAnime.COMPLETED
-        }
-    }
-
-    private fun parseAnimeDetailsFromHtml(html: String): SAnime {
-        val document = Jsoup.parse(html)
-        return SAnime.create().apply {
-            title = document.selectFirst("h1.tv-title")?.text() ?: ""
+            title = document.selectFirst("h1")?.text()
+                ?: document.selectFirst("meta[property=og:title]")?.attr("content")
+                ?: ""
             thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("content")
-            description = document.selectFirst("div.hvp-description")?.text()
+            description = document.selectFirst("meta[name=description]")?.attr("content")
+                ?: document.selectFirst("meta[property=og:description]")?.attr("content")
             status = SAnime.COMPLETED
         }
     }
 
     // ============================== Episodes ==============================
-    override fun episodeListRequest(anime: SAnime): Request {
-        return animeDetailsRequest(anime)
+    override fun episodeListSelector(): String = "html"
+
+    override fun episodeFromElement(element: Element): SEpisode {
+        return SEpisode.create().apply {
+            name = "Episode 1"
+            episode_number = 1f
+            url = element.ownerDocument()?.location() ?: ""
+        }
     }
 
     override fun episodeListParse(response: Response): List<SEpisode> {
-        val body = response.body.string()
-        var slug = ""
-
-        if (!body.trimStart().startsWith("<")) {
-            val jsonObj = json.parseToJsonElement(body).jsonObject
-            val videoObj = jsonObj["hentai_video"]?.jsonObject
-            slug = videoObj?.get("slug")?.jsonPrimitive?.content ?: ""
-        }
-
         val episode = SEpisode.create().apply {
             name = "Episode 1"
             episode_number = 1f
-            url = if (slug.isNotEmpty()) "/hentai-videos/$slug" else response.request.url.encodedPath
+            url = response.request.url.encodedPath
         }
-
         return listOf(episode)
     }
 
     // ============================== Video Streams ==============================
-    override fun videoListRequest(episode: SEpisode): Request {
-        val slug = episode.url.substringAfterLast("/")
-        return GET("$apiBaseUrl/video?id=$slug", headers)
+    override fun videoListSelector(): String = "video source, iframe"
+
+    override fun videoFromElement(element: Element): Video {
+        val videoUrl = element.attr("src")
+        val quality = if (element.tagName() == "iframe") "Embed Server" else "720p"
+        return Video(videoUrl, quality, videoUrl)
+    }
+
+    override fun videoUrlParse(document: Document): String {
+        throw UnsupportedOperationException("Not used")
     }
 
     override fun videoListParse(response: Response): List<Video> {
-        val body = response.body.string()
+        val document = Jsoup.parse(response.body.string())
         val videoList = mutableListOf<Video>()
 
-        if (body.trimStart().startsWith("<")) {
-            return videoList
+        document.select("video source").forEach { element: Element ->
+            val src = element.attr("src")
+            if (src.isNotBlank()) {
+                videoList.add(Video(src, "720p", src))
+            }
         }
 
-        val jsonObj = json.parseToJsonElement(body).jsonObject
-        val manifestObj = jsonObj["videos_manifest"]?.jsonObject ?: return videoList
-        val serversArray = manifestObj["servers"]?.jsonArray ?: return videoList
+        document.select("iframe").forEach { element: Element ->
+            val src = element.attr("src")
+            if (src.isNotBlank()) {
+                videoList.add(Video(src, "Embed Server", src))
+            }
+        }
 
-        serversArray.forEach { serverElem ->
-            val serverObj = serverElem.jsonObject
-            val serverName = serverObj["name"]?.jsonPrimitive?.content ?: "Hanime"
-            val streamsArray = serverObj["streams"]?.jsonArray ?: return@forEach
-
-            streamsArray.forEach { streamElem ->
-                val streamObj = streamElem.jsonObject
-                val streamUrl = streamObj["url"]?.jsonPrimitive?.content ?: return@forEach
-                val height = streamObj["height"]?.jsonPrimitive?.content ?: "720"
-
-                if (streamUrl.isNotBlank()) {
-                    val quality = "$serverName - ${height}p"
-                    videoList.add(Video(streamUrl, quality, streamUrl))
+        if (videoList.isEmpty()) {
+            document.select("script[type=application/ld+json]").forEach { script ->
+                val json = script.data()
+                if (json.contains("embedUrl")) {
+                    val embedUrl = json.substringAfter("\"embedUrl\":\"").substringBefore("\"")
+                    if (embedUrl.isNotBlank()) {
+                        videoList.add(Video(embedUrl, "Web Player", embedUrl))
+                    }
                 }
             }
         }
 
-        return videoList.sortedByDescending { it.quality }
+        if (videoList.isEmpty()) {
+            val pageUrl = response.request.url.toString()
+            videoList.add(Video(pageUrl, "Web Stream", pageUrl))
+        }
+
+        return videoList
     }
 }
