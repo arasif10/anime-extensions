@@ -35,13 +35,13 @@ class Hanime : AnimeHttpSource() {
 
     private val json: Json by injectLazy()
 
-    private val apiBaseUrl = "https://members.hanime.tv/api/v8"
-    private val searchApiUrl = "https://search.htv-services.workers.dev"
+    private val apiBaseUrl = "https://hanime.tv/api/v8"
+    private val searchApiUrl = "https://hanime.tv/api/v8/search"
 
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .add("X-Signature-Version", "web2")
-        .add("Referer", "$baseUrl/")
+        .add("Referer", "/")
 
     // ============================== Popular Anime ==============================
     override fun popularAnimeRequest(page: Int): Request {
@@ -53,7 +53,7 @@ class Hanime : AnimeHttpSource() {
                 "blacklist": [],
                 "order_by": "views",
                 "ordering": "desc",
-                "page": ${page - 1}
+                "page": 
             }
         """.trimIndent()
         val body = payload.toRequestBody("application/json".toMediaType())
@@ -74,7 +74,7 @@ class Hanime : AnimeHttpSource() {
                 "blacklist": [],
                 "order_by": "created_at_unix",
                 "ordering": "desc",
-                "page": ${page - 1}
+                "page": 
             }
         """.trimIndent()
         val body = payload.toRequestBody("application/json".toMediaType())
@@ -89,13 +89,13 @@ class Hanime : AnimeHttpSource() {
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
         val payload = """
             {
-                "search_text": "$query",
+                "search_text": "",
                 "tags": [],
                 "brands": [],
                 "blacklist": [],
                 "order_by": "created_at_unix",
                 "ordering": "desc",
-                "page": ${page - 1}
+                "page": 
             }
         """.trimIndent()
         val body = payload.toRequestBody("application/json".toMediaType())
@@ -125,7 +125,7 @@ class Hanime : AnimeHttpSource() {
             val obj = element.jsonObject
             val anime = SAnime.create().apply {
                 val slug = obj["slug"]?.jsonPrimitive?.content ?: ""
-                url = "/hentai-videos/$slug"
+                url = "/hentai-videos/"
                 title = obj["name"]?.jsonPrimitive?.content ?: ""
                 thumbnail_url = obj["cover_url"]?.jsonPrimitive?.content ?: obj["poster_url"]?.jsonPrimitive?.content
             }
@@ -142,7 +142,7 @@ class Hanime : AnimeHttpSource() {
     // ============================== Details ==============================
     override fun animeDetailsRequest(anime: SAnime): Request {
         val slug = anime.url.substringAfterLast("/")
-        return GET("$apiBaseUrl/video?id=$slug", headers)
+        return GET("/video?id=", headers)
     }
 
     override fun animeDetailsParse(response: Response): SAnime {
@@ -197,7 +197,7 @@ class Hanime : AnimeHttpSource() {
         val episode = SEpisode.create().apply {
             name = "Episode 1"
             episode_number = 1f
-            url = if (slug.isNotEmpty()) "/hentai-videos/$slug" else response.request.url.encodedPath
+            url = if (slug.isNotEmpty()) "/hentai-videos/" else response.request.url.encodedPath
         }
 
         return listOf(episode)
@@ -206,7 +206,7 @@ class Hanime : AnimeHttpSource() {
     // ============================== Video Streams ==============================
     override fun videoListRequest(episode: SEpisode): Request {
         val slug = episode.url.substringAfterLast("/")
-        return GET("$apiBaseUrl/video?id=$slug", headers)
+        return GET("/video?id=", headers)
     }
 
     override fun videoListParse(response: Response): List<Video> {
@@ -232,7 +232,7 @@ class Hanime : AnimeHttpSource() {
                 val height = streamObj["height"]?.jsonPrimitive?.content ?: "720"
 
                 if (streamUrl.isNotBlank()) {
-                    val quality = "$serverName - ${height}p"
+                    val quality = " - p"
                     videoList.add(Video(streamUrl, quality, streamUrl))
                 }
             }
