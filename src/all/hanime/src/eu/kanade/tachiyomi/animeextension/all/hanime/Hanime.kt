@@ -178,7 +178,7 @@ class Hanime : ParsedAnimeHttpSource() {
         val videoList = mutableListOf<Video>()
         val vHeaders = videoHeaders()
 
-        // 1. Extract direct <video source> elements
+        // 1. Direct video source elements
         document.select("video source").forEach { element: Element ->
             val src = element.attr("src")
             if (src.isNotBlank()) {
@@ -187,7 +187,7 @@ class Hanime : ParsedAnimeHttpSource() {
             }
         }
 
-        // 2. Extract <iframe> embed servers
+        // 2. Direct iframe embeds
         document.select("iframe").forEach { element: Element ->
             val src = element.attr("src")
             if (src.isNotBlank()) {
@@ -195,7 +195,7 @@ class Hanime : ParsedAnimeHttpSource() {
             }
         }
 
-        // 3. Extract .m3u8 or .mp4 stream URLs from script tags using Regex
+        // 3. Regex scan for direct .m3u8 or .mp4 URLs in script tags
         val streamPattern = Pattern.compile("https?://[^\"'\\s]+\\.(m3u8|mp4)[^\"'\\s]*")
         val matcher = streamPattern.matcher(html)
         val foundStreams = mutableSetOf<String>()
@@ -208,11 +208,15 @@ class Hanime : ParsedAnimeHttpSource() {
             }
         }
 
-        // 4. Web Player Embed fallback
+        // 4. Web Player Embed fallback with player headers
         val slug = response.request.url.encodedPath.substringAfterLast("/").trim()
         if (slug.isNotBlank()) {
             val playerUrl = "https://player.hanime.tv/?id=$slug"
-            videoList.add(Video(playerUrl, "Hanime Web Stream", playerUrl, headers = vHeaders))
+            val pHeaders = headers.newBuilder()
+                .set("Referer", "https://player.hanime.tv/")
+                .set("Origin", "https://player.hanime.tv")
+                .build()
+            videoList.add(Video(playerUrl, "Hanime Web Player (WebView/External)", playerUrl, headers = pHeaders))
         }
 
         return videoList.distinctBy { it.videoUrl }
