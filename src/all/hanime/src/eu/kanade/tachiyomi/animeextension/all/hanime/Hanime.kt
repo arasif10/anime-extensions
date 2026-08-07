@@ -10,10 +10,11 @@ import eu.kanade.tachiyomi.network.GET
 import okhttp3.Headers
 import okhttp3.Request
 import okhttp3.Response
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.util.regex.Pattern
+import java.security.MessageDigest
 
 class Hanime : ParsedAnimeHttpSource() {
 
@@ -33,9 +34,9 @@ class Hanime : ParsedAnimeHttpSource() {
         .add("Origin", "https://hanime.tv")
         .add("Referer", "$baseUrl/")
 
-    private fun videoHeaders(): Headers = headers.newBuilder()
-        .set("Referer", "https://hanime.tv/")
-        .set("Origin", "https://hanime.tv")
+    private fun playerVideoHeaders(): Headers = headers.newBuilder()
+        .set("Referer", "https://player.hanime.tv/")
+        .set("Origin", "https://player.hanime.tv")
         .build()
 
     // ============================== Popular Anime ==============================
@@ -121,15 +122,39 @@ class Hanime : ParsedAnimeHttpSource() {
             title = document.selectFirst("h1")?.text()
                 ?: document.selectFirst("meta[property=og:title]")?.attr("content")
                 ?: ""
+
             thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("content")
                 ?: document.selectFirst("img.hvpi-cover, img.cover")?.attr("src")
 
-            description = document.selectFirst("meta[name=description]")?.attr("content")
-                ?: document.selectFirst("meta[property=og:description]")?.attr("content")
-                ?: document.select("div.hvpist-description p, div.description p, p.text-gray-400").text()
+            // Extract real clean synopsis by filtering out SEO / site UI text
+            val pTags = document.select("p")
+            val synopsisParagraphs = mutableListOf<String>()
+            for (p in pTags) {
+                val text = p.text().trim()
+                if (text.length > 20 &&
+                    !text.contains("Watch ", ignoreCase = true) &&
+                    !text.contains("online", ignoreCase = true) &&
+                    !text.contains("account", ignoreCase = true) &&
+                    !text.contains("download", ignoreCase = true) &&
+                    !text.contains("Share a bug", ignoreCase = true) &&
+                    !text.contains("Session data", ignoreCase = true) &&
+                    !text.contains("refresh the page", ignoreCase = true) &&
+                    !text.contains("playlists", ignoreCase = true) &&
+                    !text.contains("cookie", ignoreCase = true)
+                ) {
+                    synopsisParagraphs.add(text)
+                }
+            }
 
-            genre = document.select("a[href*=/genres/], a[href*=/tags/], div.tags a, span.tag").joinToString { it.text() }
-            author = document.selectFirst("a[href*=/brands/], a.brand")?.text() ?: ""
+            description = if (synopsisParagraphs.isNotEmpty()) {
+                synopsisParagraphs.joinToString("\n\n")
+            } else {
+                document.selectFirst("meta[name=description]")?.attr("content")
+                    ?: document.selectFirst("meta[property=og:description]")?.attr("content")
+            }
+
+            genre = document.select("a[href*=/browse/tags/], a[href*=/genres/], a[href*=/tags/], div.tags a, span.tag").joinToString { it.text() }
+            author = document.selectFirst("a[href*=/browse/brands/], a[href*=/brands/], a.brand")?.text() ?: ""
             status = SAnime.COMPLETED
         }
     }
@@ -165,7 +190,7 @@ class Hanime : ParsedAnimeHttpSource() {
     override fun videoFromElement(element: Element): Video {
         val videoUrl = element.attr("src")
         val quality = if (element.tagName() == "iframe") "Embed Server" else "720p"
-        return Video(videoUrl, quality, videoUrl, headers = videoHeaders())
+        return Video(videoUrl, quality, videoUrl, headers = playerVideoHeaders())
     }
 
     override fun videoUrlParse(document: Document): String {
@@ -176,47 +201,88 @@ class Hanime : ParsedAnimeHttpSource() {
         val html = response.body.string()
         val document = Jsoup.parse(html)
         val videoList = mutableListOf<Video>()
-        val vHeaders = videoHeaders()
+        val pHeaders = playerVideoHeaders()
 
-        // 1. Direct video source elements
+        val slug = response.request.url.encodedPath.substringAfterLast("/").trim()
+
+        // Attempt 1: Fetch signed video API manifest directly
+        if (slug.isNotBlank()) {
+            try {
+                val timestamp = System.currentTimeMillis() / 1000L
+                val input = "$timestamp,Xkdi29,https://hanime.tv,mn2,$timestamp"
+                val digest = MessageDigest.getInstance("SHA-256")
+                val hashBytes = digest.digest(input.toByteArray(Charsets.UTF_8))
+                val hexSig = hashBytes.joinToString("") { "%02x".format(it) }
+
+                val apiHeaders = headers.newBuilder()
+                    .add("X-Signature-Version", "web2")
+                    .add("X-Signature", hexSig)
+                    .add("X-Time", timestamp.toString())
+                    .build()
+
+                val apiUrls = arrayOf(
+                    "$baseUrl/api/v8/video?id=$slug",
+                    "https://guest.freeanimehentai.net/api/v8/video?id=$slug",
+                )
+
+                for (apiUrl in apiUrls) {
+                    try {
+                        val apiReq = GET(apiUrl, apiHeaders)
+                        val apiRes = client.newCall(apiReq).execute()
+                        if (apiRes.isSuccessful) {
+                            val jsonStr = apiRes.body.string()
+                            if (jsonStr.contains("videos_manifest")) {
+                                val jsonObj = JSONObject(jsonStr)
+                                if (jsonObj.has("videos_manifest")) {
+                                    val manifest = jsonObj.getJSONObject("videos_manifest")
+                                    if (manifest.has("servers")) {
+                                        val servers = manifest.getJSONArray("servers")
+                                        for (i in 0 until servers.length()) {
+                                            val server = servers.getJSONObject(i)
+                                            val serverName = server.optString("name", "Server")
+                                            val streams = server.getJSONArray("streams")
+                                            for (j in 0 until streams.length()) {
+                                                val stream = streams.getJSONObject(j)
+                                                val streamUrl = stream.optString("url")
+                                                val height = stream.optInt("height", 720)
+                                                val kind = stream.optString("kind", "")
+                                                if (streamUrl.isNotBlank() && kind != "premium_alert") {
+                                                    videoList.add(Video(streamUrl, "$serverName - ${height}p", streamUrl, headers = pHeaders))
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        // Attempt 2: Extract direct <video source> elements
         document.select("video source").forEach { element: Element ->
             val src = element.attr("src")
             if (src.isNotBlank()) {
                 val quality = element.attr("res").ifEmpty { element.attr("label") }.ifEmpty { "720p" }
-                videoList.add(Video(src, quality, src, headers = vHeaders))
+                videoList.add(Video(src, quality, src, headers = pHeaders))
             }
         }
 
-        // 2. Direct iframe embeds
+        // Attempt 3: Extract <iframe> embed servers
         document.select("iframe").forEach { element: Element ->
             val src = element.attr("src")
             if (src.isNotBlank()) {
-                videoList.add(Video(src, "Embed Server", src, headers = vHeaders))
+                videoList.add(Video(src, "Embed Server", src, headers = pHeaders))
             }
         }
 
-        // 3. Regex scan for direct .m3u8 or .mp4 URLs in script tags
-        val streamPattern = Pattern.compile("https?://[^\"'\\s]+\\.(m3u8|mp4)[^\"'\\s]*")
-        val matcher = streamPattern.matcher(html)
-        val foundStreams = mutableSetOf<String>()
-
-        while (matcher.find()) {
-            val url = matcher.group()
-            if (foundStreams.add(url)) {
-                val quality = if (url.contains("1080")) "1080p" else if (url.contains("480")) "480p" else if (url.contains("360")) "360p" else "720p"
-                videoList.add(Video(url, quality, url, headers = vHeaders))
-            }
-        }
-
-        // 4. Web Player Embed fallback with player headers
-        val slug = response.request.url.encodedPath.substringAfterLast("/").trim()
+        // Attempt 4: Web Player Embed fallback
         if (slug.isNotBlank()) {
             val playerUrl = "https://player.hanime.tv/?id=$slug"
-            val pHeaders = headers.newBuilder()
-                .set("Referer", "https://player.hanime.tv/")
-                .set("Origin", "https://player.hanime.tv")
-                .build()
-            videoList.add(Video(playerUrl, "Hanime Web Player (WebView/External)", playerUrl, headers = pHeaders))
+            videoList.add(Video(playerUrl, "Hanime Web Player Stream", playerUrl, headers = pHeaders))
         }
 
         return videoList.distinctBy { it.videoUrl }
