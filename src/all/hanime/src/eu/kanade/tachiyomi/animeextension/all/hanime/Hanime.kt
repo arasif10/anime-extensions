@@ -460,26 +460,46 @@ class Hanime : AnimeHttpSource() {
     }
 
     // ============================== Episodes ==============================
+    // Episodes are parsed from the video's details page, which lists every
+    // episode of the series via data-video-href attributes. This avoids the
+    // multi-megabyte full-catalog download the search API needs (which can time
+    // out on mobile, leaving the episode list empty).
     override fun episodeListRequest(anime: SAnime): Request {
-        val slug = anime.url.substringAfterLast("/")
-        return if (!catalogFresh()) {
-            GET("$searchApiUrl?search_text=&slug=$slug", headers)
-        } else {
-            GET("$baseUrl/favicon.ico?slug=$slug", headers)
-        }
+        val url = if (anime.url.startsWith("http")) anime.url else "$baseUrl${anime.url}"
+        return GET(url, headers)
     }
 
     override fun episodeListParse(response: Response): List<SEpisode> {
-        val slug = response.request.url.queryParameter("slug") ?: run {
-            response.body.close()
-            return emptyList()
+        val document = Jsoup.parse(response.body.string())
+        val slug = response.request.url.toString()
+            .substringBefore("?")
+            .substringAfterLast("/")
+        val base = baseSlug(slug)
+
+        val seen = HashSet<String>()
+        val episodes = mutableListOf<SEpisode>()
+
+        // The details page also lists "related videos" from other series, so only
+        // keep slugs sharing the same base slug as the opened entry.
+        document.select("[data-video-href*=/videos/hentai/]").forEach { element ->
+            val epSlug = element.attr("data-video-href")
+                .substringBefore("?")
+                .substringAfterLast("/")
+            if (epSlug.isBlank()) return@forEach
+            if (baseSlug(epSlug) != base) return@forEach
+            if (!seen.add(epSlug)) return@forEach
+
+            val number = episodeNumber(epSlug)
+            episodes.add(
+                SEpisode.create().apply {
+                    name = if (number > 0) "Episode $number" else epSlug
+                    episode_number = number.toFloat().coerceAtLeast(1f)
+                    url = "/videos/hentai/$epSlug"
+                },
+            )
         }
 
-        val base = baseSlug(slug)
-        val episodes = resolveCatalog(response)
-            .filter { baseSlug(it.slug) == base }
-            .sortedBy { episodeNumber(it.slug) }
-            .map { it.toSEpisode() }
+        episodes.sortBy { it.episode_number }
 
         return episodes.ifEmpty {
             listOf(
@@ -490,19 +510,6 @@ class Hanime : AnimeHttpSource() {
                 },
             )
         }
-    }
-
-    private fun CatalogEntry.toSEpisode(): SEpisode = SEpisode.create().apply {
-        val number = episodeNumber(slug)
-        val seasonMatch = seasonSuffixRegex.find(name)
-        name = when {
-            // Videos whose title is a season ("... Season 1") keep a Season label.
-            seasonMatch != null -> seasonMatch.value.trim().replaceFirstChar { it.uppercase() }
-            number > 0 -> "Episode $number"
-            else -> name
-        }
-        episode_number = number.toFloat().coerceAtLeast(1f)
-        url = "/videos/hentai/$slug"
     }
 
     // ============================== Video Streams ==============================
