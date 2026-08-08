@@ -502,10 +502,11 @@ class Hanime : AnimeHttpSource() {
         episodes.sortBy { it.episode_number }
 
         return episodes.ifEmpty {
+            val fallbackNumber = episodeNumber(slug)
             listOf(
                 SEpisode.create().apply {
-                    name = "Episode 1"
-                    episode_number = 1f
+                    name = if (fallbackNumber > 0) "Episode $fallbackNumber" else "Episode 1"
+                    episode_number = fallbackNumber.toFloat().coerceAtLeast(1f)
                     url = "/videos/hentai/$slug"
                 },
             )
