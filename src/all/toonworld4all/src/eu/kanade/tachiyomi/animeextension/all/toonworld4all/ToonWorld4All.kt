@@ -12,6 +12,7 @@ import okhttp3.Request
 import okhttp3.Response
 import org.json.JSONObject
 import org.jsoup.Jsoup
+import rx.Observable
 
 class ToonWorld4All : AnimeHttpSource() {
 
@@ -74,6 +75,20 @@ class ToonWorld4All : AnimeHttpSource() {
     override fun searchAnimeParse(response: Response): AnimesPage = popularAnimeParse(response)
 
     // ============================== Details ==============================
+    // The app (AniZen) requires the returned SAnime to have every mandatory
+    // field set. `url` is a lateinit property in the app's models and reading it
+    // uninitialized crashes with "lateinit property url/name has not been
+    // initialized" when opening an entry, so we always carry over the original
+    // url onto the parsed details.
+    override fun fetchAnimeDetails(anime: SAnime): Observable<SAnime> {
+        return super.fetchAnimeDetails(anime)
+            .map { it.apply { url = anime.url } }
+    }
+
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime {
+        return super.getAnimeDetails(anime).apply { url = anime.url }
+    }
+
     override fun animeDetailsRequest(anime: SAnime): Request = GET(anime.url, headers)
 
     override fun animeDetailsParse(response: Response): SAnime {
@@ -82,8 +97,8 @@ class ToonWorld4All : AnimeHttpSource() {
             title = document.selectFirst("h1.entry-title")?.text().orEmpty()
             thumbnail_url = document.selectFirst("img.wp-post-image")?.attr("src")
                 ?: document.selectFirst("meta[property=og:image]")?.attr("content")
-            description = document.select("div.herald-entry-content p").text()
-                .ifBlank { document.select("div.entry-content p").text() }
+            description = document.select("div.herald-entry-content p").joinToString("\n\n") { it.text() }
+                .ifBlank { document.select("div.entry-content p").joinToString("\n\n") { it.text() } }
             genre = document.select("span.meta-category a").joinToString { it.text() }
             status = SAnime.UNKNOWN
         }
@@ -139,21 +154,24 @@ class ToonWorld4All : AnimeHttpSource() {
         val videos = mutableListOf<Video>()
         for (i in 0 until encodes.length()) {
             val encode = encodes.getJSONObject(i)
-            val resolution = encode.getString("resolution")
+            val resolution = encode.optString("resolution")
             val files = encode.optJSONArray("files") ?: continue
             for (j in 0 until files.length()) {
-                val file = files.getJSONObject(j)
-                val hostName = file.getString("host")
-                val fileLink = file.getString("link")
-                val redirectUrl = if (fileLink.startsWith("/")) "$archiveUrl$fileLink" else fileLink
+                // Isolate each host so a single malformed entry or dead link
+                // can never wipe out the whole episode's video list.
+                runCatching {
+                    val file = files.getJSONObject(j)
+                    val hostName = file.optString("host").ifBlank { "Host" }
+                    val fileLink = file.optString("link").ifBlank { return@runCatching }
+                    val redirectUrl = if (fileLink.startsWith("/")) "$archiveUrl$fileLink" else fileLink
 
-                val hostUrl = runCatching { resolveBridgeHops(redirectUrl) }.getOrNull()
-                    ?: continue
+                    val hostUrl = resolveBridgeHops(redirectUrl) ?: return@runCatching
 
-                if (hostName.contains("HubCloud", ignoreCase = true) || hostName.contains("GDFlix", ignoreCase = true)) {
-                    videos += deepExtractVideos(hostUrl, resolution, hostName)
-                } else {
-                    videos += Video(hostUrl, "$resolution - $hostName (Portal)", hostUrl, headers)
+                    if (hostName.contains("HubCloud", ignoreCase = true) || hostName.contains("GDFlix", ignoreCase = true)) {
+                        videos += deepExtractVideos(hostUrl, resolution, hostName)
+                    } else {
+                        videos += Video(hostUrl, "$resolution - $hostName (Portal)", hostUrl, headers)
+                    }
                 }
             }
         }
@@ -167,8 +185,11 @@ class ToonWorld4All : AnimeHttpSource() {
 
     /**
      * Follows the archive redirect link. The /redirect/ endpoint returns a small
-     * page whose JSON carries the final destination (a shortener or the file
-     * host page), so parse that when a plain redirect chain is not used.
+     * page whose JSON carries a `destination` (usually an ad-gated shortener)
+     * and a `link` object with `domain` + `hidden` that together form the
+     * direct file-host URL (e.g. hubcloud.cx/video/<id>). Prefer the direct
+     * file URL so playback/portal opens the actual file page instead of the
+     * shortener. If a plain redirect chain is used, return its final URL.
      */
     private fun resolveBridgeHops(url: String): String? {
         val bridgeHeaders = headers.newBuilder()
@@ -183,6 +204,19 @@ class ToonWorld4All : AnimeHttpSource() {
             }
 
             val html = response.body.string()
+            val propsJson = html.substringAfter("window.__PROPS__ = ")
+                .substringBefore(";")
+            val props = runCatching { JSONObject(propsJson) }.getOrNull()
+            if (props != null) {
+                val link = props.optJSONObject("link")
+                val domain = link?.optString("domain").orEmpty()
+                val hidden = link?.optString("hidden").orEmpty()
+                if (domain.isNotBlank() && hidden.isNotBlank()) {
+                    return domain.trimEnd('/') + "/" + hidden.trimStart('/')
+                }
+                val destination = props.optString("destination")
+                if (destination.isNotBlank()) return destination.replace("\\/", "/")
+            }
             val destRegex = Regex("""\"destination\":\"(.*?)\"""")
             return destRegex.find(html)?.groupValues?.get(1)?.replace("\\/", "/")
         }
@@ -200,7 +234,7 @@ class ToonWorld4All : AnimeHttpSource() {
         client.newCall(GET(hostUrl, hostHeaders)).execute().use { response ->
             val html = response.body.string()
 
-            val tokRegex = Regex("""href="([^"]+tok=[^"]+)" """, RegexOption.DOT_MATCHES_ALL)
+            val tokRegex = Regex("""href="([^"]+tok=[^"]+)"""", RegexOption.DOT_MATCHES_ALL)
             val downloadRegex = Regex("""\"([^"]+/download/[^"]+)\"""", RegexOption.DOT_MATCHES_ALL)
             val fileRegex = Regex("""file:\s*\"([^"]+)\"""", RegexOption.DOT_MATCHES_ALL)
 
