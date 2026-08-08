@@ -567,7 +567,9 @@ class Hanime : AnimeHttpSource() {
             )
         }
 
-        episodes.sortBy { it.episode_number }
+        // Newest episode on top (4, 3, 2, 1), matching the convention used by
+        // other anime extensions.
+        episodes.sortByDescending { it.episode_number }
 
         return episodes.ifEmpty {
             val fallbackNumber = episodeNumber(slug)
