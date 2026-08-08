@@ -8,6 +8,7 @@ import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
 import org.json.JSONObject
@@ -69,7 +70,12 @@ class ToonWorld4All : AnimeHttpSource() {
 
     // ============================== Search ==============================
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        return GET("$baseUrl/page/$page/?s=$query", headers)
+        // Build with HttpUrl so the query is percent-encoded; a raw "?s=$query"
+        // breaks on spaces and special characters like & or #.
+        val url = "$baseUrl/page/$page/".toHttpUrl().newBuilder()
+            .addQueryParameter("s", query)
+            .build()
+        return GET(url, headers)
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage = popularAnimeParse(response)
