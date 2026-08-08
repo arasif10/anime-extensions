@@ -328,11 +328,14 @@ class Hanime : AnimeHttpSource() {
         var list = catalog
 
         if (query.isNotBlank()) {
-            val q = query.lowercase()
-            list = list.filter {
-                it.name.lowercase().contains(q) ||
-                    it.slug.contains(q) ||
-                    it.searchTitles.lowercase().contains(q)
+            // AniZen's "Similar Media" sends the title as space-separated
+            // keywords (e.g. "yabai fukushuu yami site"), so match each token
+            // independently instead of requiring the whole phrase (which fails
+            // on punctuation like "Yabai!").
+            val tokens = query.lowercase().split(" ").filter { it.isNotBlank() }
+            list = list.filter { entry ->
+                val haystack = "${entry.name} ${entry.slug} ${entry.searchTitles}".lowercase()
+                tokens.all { haystack.contains(it) }
             }
         }
 
@@ -457,6 +460,51 @@ class Hanime : AnimeHttpSource() {
                     ?.trim()
             status = SAnime.COMPLETED
         }
+    }
+
+    // ============================== Recommendations ==============================
+    // AniZen populates its "See Recommendations" screen with several sections.
+    // The "Recommended" section is only filled when the extension declares
+    // `supportsRelatedAnimes` and implements `fetchRelatedAnimeList`. Those
+    // members exist on AniZen's runtime source API but not on the older lib-14
+    // stub we compile against, so they are declared without `override` — the
+    // JVM dispatches the runtime interface default methods to them anyway.
+    // We recommend other series sharing the most genre tags with the current
+    // anime, using the already-cached catalog (no extra network download).
+
+    val supportsRelatedAnimes: Boolean get() = true
+
+    suspend fun fetchRelatedAnimeList(anime: SAnime): List<SAnime> {
+        var tags = (anime.genre ?: "")
+            .split(",")
+            .map { it.trim().lowercase() }
+            .filter { it.isNotBlank() }
+
+        if (tags.isEmpty()) {
+            // Genre not populated yet — pull the tag list from the details page.
+            tags = runCatching {
+                val request = animeDetailsRequest(anime)
+                client.newCall(request).execute().use { response ->
+                    Jsoup.parse(response.body.string())
+                        .select("a[href*=/browse/tags/]")
+                        .mapNotNull { it.text().trim().lowercase().ifBlank { null } }
+                }
+            }.getOrDefault(emptyList())
+        }
+        if (tags.isEmpty()) return emptyList()
+
+        val currentSlug = anime.url.substringAfterLast("/")
+        val currentBase = baseSlug(currentSlug)
+
+        return runCatching {
+            groupedCatalog(getCatalog())
+                .filter { baseSlug(it.slug) != currentBase }
+                .map { entry -> entry to entry.tags.count { it in tags } }
+                .filter { it.second > 0 }
+                .sortedByDescending { it.second }
+                .take(24)
+                .map { it.first.toSAnime() }
+        }.getOrDefault(emptyList())
     }
 
     // ============================== Episodes ==============================
