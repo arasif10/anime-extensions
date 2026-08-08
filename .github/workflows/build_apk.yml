@@ -7,6 +7,11 @@ on:
       - master
   workflow_dispatch:
 
+env:
+  KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+  KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+  ALIAS: ${{ secrets.ALIAS }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -20,6 +25,11 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+
+      - name: Restore signing keystore
+        run: |
+          echo "${{ secrets.SIGNING_KEY }}" | base64 -d > signingkey.jks
+          ls -la signingkey.jks
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
