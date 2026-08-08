@@ -43,8 +43,6 @@ class Hanime : AnimeHttpSource() {
 
     private val trailingEpisodeRegex = Regex("""-\d+$""")
 
-    private val trailingEpisodeNameRegex = Regex("""\s\d+$""")
-
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .add("User-Agent", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36")
         .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
@@ -168,8 +166,6 @@ class Hanime : AnimeHttpSource() {
     private fun episodeNumber(slug: String): Int =
         trailingEpisodeRegex.find(slug)?.groupValues?.get(0)?.removePrefix("-")?.toIntOrNull() ?: 0
 
-    private fun seriesTitle(name: String): String = name.replace(trailingEpisodeNameRegex, "").trim()
-
     private fun yearOf(epochSeconds: Long): Int {
         if (epochSeconds <= 0) return 0
         return Calendar.getInstance().apply { timeInMillis = epochSeconds * 1000 }.get(Calendar.YEAR)
@@ -193,7 +189,7 @@ class Hanime : AnimeHttpSource() {
     }
 
     private fun CatalogEntry.toSAnime(): SAnime = SAnime.create().apply {
-        title = seriesTitle(name)
+        title = name.trim()
         url = "/videos/hentai/$slug"
         thumbnail_url = coverUrl
     }
@@ -226,7 +222,7 @@ class Hanime : AnimeHttpSource() {
             items.add(
                 SAnime.create().apply {
                     url = "/videos/hentai/$slug"
-                    title = seriesTitle(rawTitle).ifEmpty { slug }
+                    title = rawTitle.ifEmpty { slug }
                     thumbnail_url = img?.attr("src")?.ifBlank { null }
                 },
             )
@@ -553,7 +549,11 @@ class Hanime : AnimeHttpSource() {
                     val kind = source.optString("kind")
                     // Skip preroll ads / promotions and empty sources
                     if (src.isBlank() || kind == "promotion") continue
-                    val streamUrl = if (src.startsWith("http")) src else "$baseUrl$src"
+                    val rawUrl = if (src.startsWith("http")) src else "$baseUrl$src"
+                    // The handshake returns extension-less HLS URLs; append .m3u8 so
+                    // aniyomi's player detects the stream as HLS (the server ignores
+                    // the suffix and still serves the playlist).
+                    val streamUrl = if (rawUrl.endsWith(".m3u8")) rawUrl else "$rawUrl.m3u8"
                     val height = source.optInt("height", 0)
                     val quality = if (height > 0) "${height}p" else source.optString("label", "HLS")
                     videoList.add(Video(streamUrl, quality, streamUrl, headers = streamHeaders()))
