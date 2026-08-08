@@ -331,8 +331,13 @@ class Hanime : AnimeHttpSource() {
             // AniZen's "Similar Media" sends the title as space-separated
             // keywords (e.g. "yabai fukushuu yami site"), so match each token
             // independently instead of requiring the whole phrase (which fails
-            // on punctuation like "Yabai!").
-            val tokens = query.lowercase().split(" ").filter { it.isNotBlank() }
+            // on punctuation like "Yabai!"). Single-character tokens (mostly
+            // digits such as episode numbers) are dropped so they don't match
+            // unrelated titles containing that digit.
+            var tokens = query.lowercase().split(" ").filter { it.length > 1 }
+            // A query that is entirely short tokens (e.g. "1 2") must not match
+            // the whole catalog, so fall back to matching the raw phrase.
+            if (tokens.isEmpty()) tokens = listOf(query.lowercase())
             list = list.filter { entry ->
                 val haystack = "${entry.name} ${entry.slug} ${entry.searchTitles}".lowercase()
                 tokens.all { haystack.contains(it) }
