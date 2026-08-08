@@ -44,6 +44,8 @@ class Hanime : AnimeHttpSource() {
 
     private val trailingEpisodeRegex = Regex("""-\d+$""")
 
+    private val trailingSeasonRegex = Regex("""-season-\d+$""", RegexOption.IGNORE_CASE)
+
     private val trailingNumberRegex = Regex("""\s+\d+\s*$""")
 
     private val episodeMarkerRegex =
@@ -169,7 +171,17 @@ class Hanime : AnimeHttpSource() {
         }
     }
 
-    private fun baseSlug(slug: String): String = slug.replace(trailingEpisodeRegex, "")
+    /**
+     * Groups slugs belonging to the same series. Trailing episode numbers are
+     * stripped ("foo-2" -> "foo"), but a trailing "-season-N" is kept intact so
+     * each season stays its own tile instead of all seasons merging into one.
+     */
+    private fun baseSlug(slug: String): String =
+        if (trailingSeasonRegex.containsMatchIn(slug)) {
+            slug
+        } else {
+            slug.replace(trailingEpisodeRegex, "")
+        }
 
     private fun episodeNumber(slug: String): Int =
         trailingEpisodeRegex.find(slug)?.groupValues?.get(0)?.removePrefix("-")?.toIntOrNull() ?: 0
@@ -183,15 +195,18 @@ class Hanime : AnimeHttpSource() {
      * Cleans a series title by dropping the trailing episode number (and any episode
      * markers such as "Ep."/"OVA") so the catalog shows the bare series name
      * (e.g. "Kaifuku Jutsushi no Yarinaoshi 1" -> "Kaifuku Jutsushi no Yarinaoshi").
-     * Only applied to multi-episode series; single-video titles are kept verbatim
-     * (e.g. "Ookii Onnanoko wa Suki Desuka? Season 1").
+     * Only applied to multi-episode series; single-video titles are kept verbatim.
+     * A trailing "Season N" is preserved ("... Season 2" is not reduced to
+     * "... Season") so season tiles keep their number.
      */
     private fun seriesTitle(name: String): String {
-        var cleaned = name.trim()
+        val trimmed = name.trim()
+        if (seasonSuffixRegex.containsMatchIn(trimmed)) return trimmed
+        var cleaned = trimmed
             .replace(trailingNumberRegex, "")
             .replace(episodeMarkerRegex, "")
             .trim()
-        if (cleaned.length < 3) cleaned = name.trim()
+        if (cleaned.length < 3) cleaned = trimmed
         return cleaned
     }
 

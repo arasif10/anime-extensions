@@ -35,7 +35,9 @@ android {
         targetSdkVersion AndroidConfig.targetSdk
         applicationIdSuffix project.parent.name + "." + project.name
         versionCode theme == null ? extVersionCode : theme.baseVersionCode + overrideVersionCode
-        versionName "14.$versionCode"
+        // Zero-pad the extension code to at least 2 digits so the version string
+        // reads 14.01, 14.02 ... 14.09, 14.10 instead of 14.1, 14.2 ...
+        versionName "14.${String.format('%02d', versionCode)}"
         base {
             archivesName = "aniyomi-$applicationIdSuffix-v$versionName"
         }
