@@ -43,6 +43,13 @@ class Hanime : AnimeHttpSource() {
 
     private val trailingEpisodeRegex = Regex("""-\d+$""")
 
+    private val trailingNumberRegex = Regex("""\s+\d+\s*$""")
+
+    private val episodeMarkerRegex =
+        Regex("""\s+(?:ep\.?|episode|episodes|ova|part|vol)\s*$""", RegexOption.IGNORE_CASE)
+
+    private val seasonSuffixRegex = Regex("""(?i)\bseason\s+\d+\s*$""")
+
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .add("User-Agent", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36")
         .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
@@ -172,12 +179,35 @@ class Hanime : AnimeHttpSource() {
     }
 
     /**
+     * Cleans a series title by dropping the trailing episode number (and any episode
+     * markers such as "Ep."/"OVA") so the catalog shows the bare series name
+     * (e.g. "Kaifuku Jutsushi no Yarinaoshi 1" -> "Kaifuku Jutsushi no Yarinaoshi").
+     * Only applied to multi-episode series; single-video titles are kept verbatim
+     * (e.g. "Ookii Onnanoko wa Suki Desuka? Season 1").
+     */
+    private fun seriesTitle(name: String): String {
+        var cleaned = name.trim()
+            .replace(trailingNumberRegex, "")
+            .replace(episodeMarkerRegex, "")
+            .trim()
+        if (cleaned.length < 3) cleaned = name.trim()
+        return cleaned
+    }
+
+    /**
      * Groups catalog entries into series by their base slug, keeping the lowest
      * episode as the series representative so each series shows up only once.
+     * The representative's title is cleaned to the bare series name when the
+     * series has more than one episode.
      */
     private fun groupedCatalog(catalog: List<CatalogEntry>): List<CatalogEntry> =
         catalog.groupBy { baseSlug(it.slug) }.values.map { group ->
-            group.minByOrNull { episodeNumber(it.slug) }!!
+            val representative = group.minByOrNull { episodeNumber(it.slug) }!!
+            if (group.size > 1) {
+                representative.copy(name = seriesTitle(representative.name))
+            } else {
+                representative
+            }
         }
 
     private fun pageCatalog(catalog: List<CatalogEntry>, page: Int): AnimesPage {
@@ -207,6 +237,16 @@ class Hanime : AnimeHttpSource() {
         val seen = HashSet<String>()
         val items = mutableListOf<SAnime>()
 
+        // Base slugs that correspond to multi-episode series, so their card titles
+        // can have the trailing episode number cleaned off. The catalog is cached,
+        // so this does not add extra network requests.
+        val multiEpisodeBases = runCatching {
+            getCatalog()
+                .groupBy { baseSlug(it.slug) }
+                .filterValues { it.size > 1 }
+                .keys
+        }.getOrDefault(emptySet())
+
         document.select("a[href*=/videos/hentai/][title^=Watch]").forEach { card ->
             val href = card.attr("href").substringBefore("?")
             val slug = href.substringAfterLast("/")
@@ -219,10 +259,15 @@ class Hanime : AnimeHttpSource() {
             val rawTitle = img?.attr("alt")?.trim().orEmpty().ifEmpty {
                 card.attr("title").removePrefix("Watch ").substringBefore(" hentai").trim()
             }
+            val cleanTitle = if (baseSlug(slug) in multiEpisodeBases) {
+                seriesTitle(rawTitle)
+            } else {
+                rawTitle
+            }
             items.add(
                 SAnime.create().apply {
                     url = "/videos/hentai/$slug"
-                    title = rawTitle.ifEmpty { slug }
+                    title = cleanTitle.ifEmpty { slug }
                     thumbnail_url = img?.attr("src")?.ifBlank { null }
                 },
             )
@@ -434,7 +479,13 @@ class Hanime : AnimeHttpSource() {
 
     private fun CatalogEntry.toSEpisode(): SEpisode = SEpisode.create().apply {
         val number = episodeNumber(slug)
-        name = if (number > 0) "Episode $number" else name
+        val seasonMatch = seasonSuffixRegex.find(name)
+        name = when {
+            // Videos whose title is a season ("... Season 1") keep a Season label.
+            seasonMatch != null -> seasonMatch.value.trim().replaceFirstChar { it.uppercase() }
+            number > 0 -> "Episode $number"
+            else -> name
+        }
         episode_number = number.toFloat().coerceAtLeast(1f)
         url = "/videos/hentai/$slug"
     }
