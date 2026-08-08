@@ -37,6 +37,8 @@ class Hanime : AnimeHttpSource() {
 
     private val searchApiUrl = "https://guest.freeanimehentai.net/api/v11/search_hvs"
 
+    private val trendingUrl = "$baseUrl/browse/trending"
+
     private val resultsPerPage = 24
 
     private val trailingEpisodeRegex = Regex("""-\d+$""")
@@ -57,38 +59,49 @@ class Hanime : AnimeHttpSource() {
         .build()
 
     // ============================== Catalog (search API) ==============================
-    // The guest search API returns the whole catalog (newest first) as a JSON array.
-    // It is fetched once and cached in memory so pagination does not re-download it.
+    // The guest search API returns the whole catalog as a JSON array (one entry per
+    // episode, in id ascending order). It is fetched once and cached in memory with a
+    // short TTL so pagination does not re-download it, yet "Latest" stays fresh.
 
     private data class CatalogEntry(
         val slug: String,
         val name: String,
+        val searchTitles: String,
         val coverUrl: String?,
         val tags: List<String>,
         val brand: String?,
         val views: Long,
         val likes: Long,
         val releasedAt: Long,
+        val createdAt: Long,
     )
 
     @Volatile
     private var catalogCache: List<CatalogEntry>? = null
 
+    @Volatile
+    private var catalogFetchedAt: Long = 0L
+
     private val catalogLock = Any()
 
+    private val catalogTtlMillis = 10 * 60 * 1000L
+
+    private fun catalogFresh(): Boolean =
+        catalogCache != null && System.currentTimeMillis() - catalogFetchedAt < catalogTtlMillis
+
     /**
-     * Returns the catalog, downloading and caching it on first use.
+     * Returns the catalog, downloading and caching it on first use (or when stale).
      */
     private fun getCatalog(): List<CatalogEntry> {
-        catalogCache?.let { return it }
         synchronized(catalogLock) {
-            catalogCache?.let { return it }
+            if (catalogFresh()) return catalogCache!!
             val request = GET("$searchApiUrl?search_text=&page=0", headers)
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     throw Exception("Search API error: ${response.code}")
                 }
                 catalogCache = parseCatalog(response.body.string())
+                catalogFetchedAt = System.currentTimeMillis()
             }
             return catalogCache!!
         }
@@ -104,6 +117,7 @@ class Hanime : AnimeHttpSource() {
                     CatalogEntry(
                         slug = obj.optString("slug"),
                         name = obj.optString("name"),
+                        searchTitles = obj.optString("search_titles"),
                         coverUrl = obj.optString("cover_url").ifEmpty {
                             obj.optString("poster_url")
                         }.ifEmpty { null },
@@ -120,6 +134,8 @@ class Hanime : AnimeHttpSource() {
                         views = obj.optLong("views", 0L),
                         likes = obj.optLong("likes", 0L),
                         releasedAt = obj.optLong("released_at_unix", 0L),
+                        createdAt = obj.optLong("created_at_unix", 0L).takeIf { it > 0 }
+                            ?: obj.optLong("released_at_unix", 0L),
                     ),
                 )
             }
@@ -135,7 +151,10 @@ class Hanime : AnimeHttpSource() {
         return if (url.contains("search_hvs")) {
             val parsed = parseCatalog(response.body.string())
             synchronized(catalogLock) {
-                catalogCache = catalogCache ?: parsed
+                if (!catalogFresh()) {
+                    catalogCache = parsed
+                    catalogFetchedAt = System.currentTimeMillis()
+                }
             }
             catalogCache!!
         } else {
@@ -179,24 +198,49 @@ class Hanime : AnimeHttpSource() {
         thumbnail_url = coverUrl
     }
 
-    // ============================== Popular Anime ==============================
+    // ============================== Popular Anime (site trending page) ==============================
+    // The browse/trending page is server-rendered with 24 cards per page, so we parse
+    // it directly. This matches the trending list shown on hanime.tv itself.
+
     override fun popularAnimeRequest(page: Int): Request {
-        return if (page == 1 || catalogCache == null) {
-            GET("$searchApiUrl?search_text=&page=$page", headers)
-        } else {
-            GET("$baseUrl/favicon.ico?page=$page", headers)
-        }
+        return GET("$trendingUrl?page=$page", headers)
     }
 
     override fun popularAnimeParse(response: Response): AnimesPage {
-        val catalog = groupedCatalog(resolveCatalog(response)).sortedByDescending { it.views }
-        val page = response.request.url.queryParameter("page")?.toIntOrNull() ?: 1
-        return pageCatalog(catalog, page)
+        val document = Jsoup.parse(response.body.string())
+        val seen = HashSet<String>()
+        val items = mutableListOf<SAnime>()
+
+        document.select("a[href*=/videos/hentai/][title^=Watch]").forEach { card ->
+            val href = card.attr("href").substringBefore("?")
+            val slug = href.substringAfterLast("/")
+            if (slug.isBlank()) return@forEach
+
+            // Group episodes of the same series so each series appears once.
+            if (!seen.add(baseSlug(slug))) return@forEach
+
+            val img = card.selectFirst("img")
+            val rawTitle = img?.attr("alt")?.trim().orEmpty().ifEmpty {
+                card.attr("title").removePrefix("Watch ").substringBefore(" hentai").trim()
+            }
+            items.add(
+                SAnime.create().apply {
+                    url = "/videos/hentai/$slug"
+                    title = seriesTitle(rawTitle).ifEmpty { slug }
+                    thumbnail_url = img?.attr("src")?.ifBlank { null }
+                },
+            )
+        }
+
+        // The pagination component renders a rel="next" link only while more
+        // pages exist, so use it as the hasNextPage signal.
+        val hasNextPage = document.selectFirst("a[rel=next]") != null
+        return AnimesPage(items, hasNextPage)
     }
 
     // ============================== Latest Updates ==============================
     override fun latestUpdatesRequest(page: Int): Request {
-        return if (page == 1 || catalogCache == null) {
+        return if (page == 1 && !catalogFresh()) {
             GET("$searchApiUrl?search_text=&page=$page", headers)
         } else {
             GET("$baseUrl/favicon.ico?page=$page", headers)
@@ -204,7 +248,9 @@ class Hanime : AnimeHttpSource() {
     }
 
     override fun latestUpdatesParse(response: Response): AnimesPage {
-        val catalog = groupedCatalog(resolveCatalog(response))
+        // The API dump is ordered by id (oldest first); sort by upload time to get
+        // actual recent releases.
+        val catalog = groupedCatalog(resolveCatalog(response)).sortedByDescending { it.createdAt }
         val page = response.request.url.queryParameter("page")?.toIntOrNull() ?: 1
         return pageCatalog(catalog, page)
     }
@@ -219,7 +265,7 @@ class Hanime : AnimeHttpSource() {
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
         searchQuery = query
         searchFilters = filters
-        return if (page == 1 || catalogCache == null) {
+        return if (page == 1 && !catalogFresh()) {
             GET("$searchApiUrl?search_text=&page=$page", headers)
         } else {
             GET("$baseUrl/favicon.ico?page=$page", headers)
@@ -241,7 +287,11 @@ class Hanime : AnimeHttpSource() {
 
         if (query.isNotBlank()) {
             val q = query.lowercase()
-            list = list.filter { it.name.lowercase().contains(q) || it.slug.contains(q) }
+            list = list.filter {
+                it.name.lowercase().contains(q) ||
+                    it.slug.contains(q) ||
+                    it.searchTitles.lowercase().contains(q)
+            }
         }
 
         val genreFilters = filters.filterIsInstance<GenreFilter>()
@@ -269,11 +319,12 @@ class Hanime : AnimeHttpSource() {
 
         val sortFilter = filters.filterIsInstance<SortFilter>().firstOrNull()
         list = when (sortFilter?.state?.let { SORT_VALUES.getOrNull(it) }) {
+            SORT_NEWEST -> list.sortedByDescending { it.createdAt }
             SORT_VIEWS -> list.sortedByDescending { it.views }
             SORT_LIKES -> list.sortedByDescending { it.likes }
             SORT_NAME_ASC -> list.sortedBy { it.name.lowercase() }
             SORT_NAME_DESC -> list.sortedByDescending { it.name.lowercase() }
-            SORT_OLDEST -> list.sortedBy { it.releasedAt }
+            SORT_OLDEST -> list.sortedBy { it.createdAt }
             else -> list
         }
 
@@ -355,7 +406,7 @@ class Hanime : AnimeHttpSource() {
     // ============================== Episodes ==============================
     override fun episodeListRequest(anime: SAnime): Request {
         val slug = anime.url.substringAfterLast("/")
-        return if (catalogCache == null) {
+        return if (!catalogFresh()) {
             GET("$searchApiUrl?search_text=&slug=$slug", headers)
         } else {
             GET("$baseUrl/favicon.ico?slug=$slug", headers)
