@@ -18,6 +18,7 @@ import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
+import rx.Observable
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Calendar
@@ -389,6 +390,20 @@ class Hanime : AnimeHttpSource() {
     )
 
     // ============================== Details ==============================
+    // The app (AniZen) requires the returned SAnime to have every mandatory
+    // field set. `url` is a lateinit property in the app's models and reading it
+    // uninitialized crashes with "lateinit property url/name has not been
+    // initialized" when opening an entry, so we always carry over the original
+    // url onto the parsed details.
+    override fun fetchAnimeDetails(anime: SAnime): Observable<SAnime> {
+        return super.fetchAnimeDetails(anime)
+            .map { it.apply { url = anime.url } }
+    }
+
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime {
+        return super.getAnimeDetails(anime).apply { url = anime.url }
+    }
+
     override fun animeDetailsRequest(anime: SAnime): Request {
         val url = if (anime.url.startsWith("http")) anime.url else "$baseUrl${anime.url}"
         return GET(url, headers)
