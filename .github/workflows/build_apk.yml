@@ -83,6 +83,19 @@ jobs:
             "https://x-access-token:${EXTENSIONS_REPO_TOKEN}@github.com/arasif10/extensions.git" \
             extensions-repo
 
+      - name: Collect extension icons
+        if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
+        run: |
+          mkdir -p icons
+          for dir in src/all/*/; do
+            ext=$(basename "$dir")
+            icon="$dir/res/mipmap-xxxhdpi/ic_launcher.png"
+            if [ -f "$icon" ]; then
+              cp "$icon" "icons/all.$ext.png"
+            fi
+          done
+          ls -la icons
+
       - name: Publish APKs and update index
         if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
-        run: python .github/publish_extensions.py --apk-dir apks --extensions-repo extensions-repo
+        run: python .github/publish_extensions.py --apk-dir apks --extensions-repo extensions-repo --icons-dir icons

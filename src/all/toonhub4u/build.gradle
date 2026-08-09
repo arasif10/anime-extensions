@@ -1,0 +1,8 @@
+ext {
+    extName = 'ToonHub4u'
+    extClass = '.ToonHub4u'
+    extVersionCode = 1
+    isNsfw = false
+}
+
+apply from: "$rootDir/common.gradle"

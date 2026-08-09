@@ -308,11 +308,28 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
     }
 
     // Popular
+    // Uses the discovery/filter endpoint (paged, ~1M catalog) instead of the
+    // ranking list, whose fixed ~52 entries made the catalogue stop scrolling
+    // after three pages. Same request shape as the default browse filters.
     override fun popularAnimeRequest(page: Int): Request {
         val host = getPreferredHost()
-        val path = if (isMobileProtocol(host)) "/wefeed-mobile-bff/tab/ranking-list" else "/wefeed-h5api-bff/ranking-list/content"
-        val url = "$host$path?tabId=0&categoryType=4516404531735022304&page=$page&perPage=20"
-        return GET(url, getApiHeaders(url))
+        val path = if (isMobileProtocol(host)) "/wefeed-mobile-bff/subject-api/list" else "/wefeed-h5api-bff/subject/filter"
+        val url = "$host$path"
+        val bodyData = JsonObject(
+            mutableMapOf(
+                "page" to kotlinx.serialization.json.JsonPrimitive(page),
+                "perPage" to kotlinx.serialization.json.JsonPrimitive(20),
+                "keyword" to kotlinx.serialization.json.JsonPrimitive(""),
+                "sort" to kotlinx.serialization.json.JsonPrimitive("ForYou"),
+                "channelId" to kotlinx.serialization.json.JsonPrimitive("0"),
+                "classify" to kotlinx.serialization.json.JsonPrimitive("All"),
+                "genre" to kotlinx.serialization.json.JsonPrimitive("All"),
+                "year" to kotlinx.serialization.json.JsonPrimitive("All"),
+                "country" to kotlinx.serialization.json.JsonPrimitive("All"),
+            ),
+        ).toString()
+        val body = bodyData.toRequestBody("application/json; charset=utf-8".toMediaType())
+        return POST(url, getApiHeaders(url, "POST", bodyData), body)
     }
 
     override fun popularAnimeParse(response: Response): AnimesPage {
@@ -709,17 +726,20 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
         val currentPage = pager?.get("page")?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 1
         val perPage = pager?.get("perPage")?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 20
         val totalCount = pager?.get("totalCount")?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0
+        val nextPage = pager?.get("nextPage")?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: currentPage
         // Robust "has next page" check:
         //  - the explicit hasMore flag (ranking + filter responses),
-        //  - a full page of results (some responses report hasMore=false while
-        //    more pages exist, notably search),
-        //  - or a total count that exceeds what we have loaded so far.
-        // A short final page therefore stops the scroll instead of issuing a
-        // pointless empty request.
+        //  - a full page of results,
+        //  - a total count that exceeds what we have loaded so far,
+        //  - or the server advertising a next page (search sets hasMore=false
+        //    even when more pages exist, so trust nextPage when items came back).
+        // A genuinely empty/short final page therefore stops the scroll instead
+        // of issuing a pointless request.
         val hasMore = animes.isNotEmpty() && (
             pager?.get("hasMore")?.jsonPrimitive?.booleanOrNull == true ||
                 animes.size >= perPage ||
-                totalCount > currentPage * perPage
+                totalCount > currentPage * perPage ||
+                nextPage > currentPage
             )
         return AnimesPage(animes, hasMore)
     }

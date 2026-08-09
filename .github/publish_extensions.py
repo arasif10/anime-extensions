@@ -74,6 +74,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--apk-dir", required=True, help="directory containing the built APKs (recursively)")
     parser.add_argument("--extensions-repo", required=True, help="checked-out clone of arasif10/extensions")
+    parser.add_argument("--icons-dir", default=None, help="optional dir with <suffix>.png icons, synced to icon/<pkg>.png")
     parser.add_argument("--dry-run", action="store_true", help="update files locally but do not commit or push")
     args = parser.parse_args()
 
@@ -120,6 +121,21 @@ def main():
             shutil.copyfile(info["file"], dest)
             changed = True
         print(f"  -> {apk_name}")
+
+    # Sync per-extension icons to icon/<pkg>.png (AniYomi fetches them from there).
+    if args.icons_dir:
+        icons_dir = Path(args.icons_dir)
+        for suffix, info in apks.items():
+            icon_src = icons_dir / f"{suffix}.png"
+            if not icon_src.exists():
+                print(f"  !! no icon for {suffix} (expected {icon_src.name}) - skipping")
+                continue
+            icon_dest = repo / "icon" / (info["pkg"] + ".png")
+            icon_dest.parent.mkdir(parents=True, exist_ok=True)
+            if not icon_dest.exists() or icon_dest.read_bytes() != icon_src.read_bytes():
+                shutil.copyfile(icon_src, icon_dest)
+                changed = True
+            print(f"  -> icon/{icon_dest.name}")
 
     if not changed:
         print("No changes - index and APKs already up to date.")
