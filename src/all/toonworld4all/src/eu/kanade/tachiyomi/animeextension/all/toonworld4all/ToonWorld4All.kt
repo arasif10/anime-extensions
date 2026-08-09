@@ -101,8 +101,11 @@ class ToonWorld4All : AnimeHttpSource() {
         val document = Jsoup.parse(response.body.string())
         return SAnime.create().apply {
             title = document.selectFirst("h1.entry-title")?.text().orEmpty()
-            thumbnail_url = document.selectFirst("img.wp-post-image")?.attr("src")
-                ?: document.selectFirst("meta[property=og:image]")?.attr("content")
+            // Prefer the og:image: the first img.wp-post-image on the details
+            // page is usually an in-article screenshot, so using it made the
+            // tile's poster change every time an entry was re-opened.
+            thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("content")
+                ?: document.selectFirst("img.wp-post-image")?.attr("src")
             description = document.select("div.herald-entry-content p").joinToString("\n\n") { it.text() }
                 .ifBlank { document.select("div.entry-content p").joinToString("\n\n") { it.text() } }
             genre = document.select("span.meta-category a").joinToString { it.text() }
@@ -174,6 +177,7 @@ class ToonWorld4All : AnimeHttpSource() {
         }
 
         // 2. File-host mirrors (HubCloud / Filepress / GDFlix / MEGA).
+        var fallbackUrl: String? = null
         media.optJSONArray("encodes")?.let { encodes ->
             for (i in 0 until encodes.length()) {
                 val encode = encodes.getJSONObject(i)
@@ -188,11 +192,16 @@ class ToonWorld4All : AnimeHttpSource() {
                         val fileLink = file.optString("link").ifBlank { return@runCatching }
                         val redirectUrl = if (fileLink.startsWith("/")) "$archiveUrl$fileLink" else fileLink
 
-                        val hostUrl = resolveBridgeHops(redirectUrl) ?: return@runCatching
+                        val bridge = resolveBridgeHops(redirectUrl) ?: return@runCatching
+                        val hostUrl = bridge.hostUrl ?: return@runCatching
+                        if (fallbackUrl.isNullOrBlank()) fallbackUrl = bridge.destination
 
                         // Hosts whose file page can expose the real stream URL.
-                        if (hostName.contains("HubCloud", ignoreCase = true) ||
-                            hostName.contains("GDFlix", ignoreCase = true) ||
+                        if (hostName.contains("HubCloud", ignoreCase = true)) {
+                            // HubCloud is dead site-wide; every /drive/<id> 404s.
+                            return@runCatching
+                        }
+                        if (hostName.contains("GDFlix", ignoreCase = true) ||
                             hostName.contains("Filepress", ignoreCase = true)
                         ) {
                             videos += deepExtractVideos(hostUrl, resolution, hostName)
@@ -204,12 +213,21 @@ class ToonWorld4All : AnimeHttpSource() {
             }
         }
 
+        // 3. Last resort: the site's own link (usually an ad-gated shortener)
+        // when every file host is dead - better than an empty list.
+        val siteLink = fallbackUrl
+        if (videos.isEmpty() && !siteLink.isNullOrBlank()) {
+            videos += Video(siteLink, "Open in Browser (Site Link)", siteLink, headers)
+        }
+
         return videos.sortedWith(
             compareByDescending<Video> { it.quality.contains("1080") }
                 .thenByDescending { it.quality.contains("720") }
                 .thenByDescending { !it.quality.contains("Portal") },
         )
     }
+
+    private data class BridgeLink(val hostUrl: String?, val destination: String?)
 
     /**
      * Quick liveness check for host pages that are only emitted as "Portal"
@@ -240,11 +258,11 @@ class ToonWorld4All : AnimeHttpSource() {
      * Follows the archive redirect link. The /redirect/ endpoint returns a small
      * page whose JSON carries a `destination` (usually an ad-gated shortener)
      * and a `link` object with `domain` + `hidden` that together form the
-     * direct file-host URL (e.g. hubcloud.cx/video/<id>). Prefer the direct
-     * file URL so playback/portal opens the actual file page instead of the
-     * shortener. If a plain redirect chain is used, return its final URL.
+     * direct file-host URL (e.g. new2.filepress.baby/file/<id>). Prefer the
+     * direct file URL so playback/portal opens the actual file page instead of
+     * the shortener. If a plain redirect chain is used, return its final URL.
      */
-    private fun resolveBridgeHops(url: String): String? {
+    private fun resolveBridgeHops(url: String): BridgeLink? {
         val bridgeHeaders = headers.newBuilder()
             .set("Referer", "$archiveUrl/")
             .build()
@@ -253,13 +271,18 @@ class ToonWorld4All : AnimeHttpSource() {
             val finalUrl = response.request.url.toString()
 
             if (!finalUrl.contains("/redirect/")) {
-                return finalUrl
+                return BridgeLink(finalUrl, null)
             }
 
             val html = response.body.string()
             val propsJson = html.substringAfter("window.__PROPS__ = ")
                 .substringBefore(";")
             val props = runCatching { JSONObject(propsJson) }.getOrNull()
+            val destination = props?.optString("destination")
+                ?.takeIf { it.isNotBlank() }
+                ?.replace("\\/", "/")
+                ?: Regex("""\"destination\":\"(.*?)\"""").find(html)
+                    ?.groupValues?.get(1)?.replace("\\/", "/")
             if (props != null) {
                 val link = props.optJSONObject("link")
                 val domain = link?.optString("domain").orEmpty()
@@ -271,23 +294,27 @@ class ToonWorld4All : AnimeHttpSource() {
                     if (hostUrl.contains("gdflix.dev")) {
                         hostUrl = hostUrl.replace("gdflix.dev", "new3.gdflix.io")
                     }
-                    return hostUrl
+                    return BridgeLink(hostUrl, destination)
                 }
-                val destination = props.optString("destination")
-                if (destination.isNotBlank()) return destination.replace("\\/", "/")
             }
-            val destRegex = Regex("""\"destination\":\"(.*?)\"""")
-            return destRegex.find(html)?.groupValues?.get(1)?.replace("\\/", "/")
+            return BridgeLink(null, destination)
         }
     }
 
     /**
-     * Some file hosts (HubCloud / GDFlix / Filepress) expose the real stream URL
-     * in their page markup. Try to grab it; otherwise fall back to opening the
-     * host page. Dead pages (404 / "File Not Found") yield nothing at all so a
-     * dead host can never surface a broken video entry.
+     * Some file hosts (GDFlix / Filepress) expose the real stream URL in their
+     * page markup. Try to grab it; otherwise fall back to opening the host
+     * page. Dead pages (404 / "File Not Found", or a Filepress id the API no
+     * longer resolves) yield nothing at all so a dead host can never surface a
+     * broken video entry.
      */
     private fun deepExtractVideos(hostUrl: String, res: String, hostName: String): List<Video> {
+        // Filepress is a JS app; its page shell always returns 200, so probe its
+        // public file API to tell live files apart from expired ones.
+        if (hostName.contains("Filepress", ignoreCase = true) && !isFilepressFileAlive(hostUrl)) {
+            return emptyList()
+        }
+
         val hostHeaders = headers.newBuilder()
             .set("Referer", hostUrl.substringBeforeLast("/") + "/")
             .build()
@@ -316,6 +343,29 @@ class ToonWorld4All : AnimeHttpSource() {
             } else {
                 listOf(Video(hostUrl, "$res - $hostName (Portal)", hostUrl, headers = hostHeaders))
             }
+        }
+    }
+
+    /**
+     * Filepress (FileBee) serves the same static app shell for every file id,
+     * so a 200 from the page proves nothing. Its public API
+     * (GET /api/file/get/<id>) is the only reliable liveness signal.
+     */
+    private fun isFilepressFileAlive(hostUrl: String): Boolean {
+        val id = hostUrl.substringAfterLast("/")
+        if (id.isBlank() || id.contains("?")) return false
+        val apiUrl = hostUrl.substringBefore("/file/") + "/api/file/get/" + id
+        return try {
+            val apiHeaders = headers.newBuilder()
+                .set("Referer", hostUrl.substringBeforeLast("/") + "/")
+                .build()
+            client.newCall(GET(apiUrl, apiHeaders)).execute().use { resp ->
+                if (resp.code != 200) return false
+                val json = runCatching { JSONObject(resp.body.string()) }.getOrNull()
+                json?.optBoolean("status") == true
+            }
+        } catch (e: Exception) {
+            false
         }
     }
 
