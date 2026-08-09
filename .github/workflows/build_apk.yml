@@ -11,6 +11,7 @@ env:
   KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
   KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
   ALIAS: ${{ secrets.ALIAS }}
+  EXTENSIONS_REPO_TOKEN: ${{ secrets.EXTENSIONS_REPO_TOKEN }}
 
 jobs:
   build:
@@ -57,26 +58,31 @@ jobs:
   publish:
     # Publish the freshly built APKs to the public arasif10/extensions repo so
     # AniZen users can update. Needs EXTENSIONS_REPO_TOKEN (a PAT with write
-    # access to arasif10/extensions) stored in this repo's secrets.
+    # access to arasif10/extensions) stored in this repo's secrets. Steps are
+    # gated on it so the job no-ops (skipped) until the secret is configured -
+    # job-level "if" cannot reference secrets, so it is exposed via env instead.
     needs: build
     runs-on: ubuntu-latest
-    if: ${{ secrets.EXTENSIONS_REPO_TOKEN != '' }}
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
 
       - name: Download built APKs
         uses: actions/download-artifact@v4
+        if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
         with:
           name: extension-apk
           path: apks
 
       - name: Clone extensions repo
+        if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
         run: |
           git clone --quiet --branch repo \
-            "https://x-access-token:${{ secrets.EXTENSIONS_REPO_TOKEN }}@github.com/arasif10/extensions.git" \
+            "https://x-access-token:${EXTENSIONS_REPO_TOKEN}@github.com/arasif10/extensions.git" \
             extensions-repo
 
       - name: Publish APKs and update index
+        if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
         run: python .github/publish_extensions.py --apk-dir apks --extensions-repo extensions-repo
