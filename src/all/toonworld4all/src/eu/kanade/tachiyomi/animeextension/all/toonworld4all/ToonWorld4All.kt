@@ -153,30 +153,52 @@ class ToonWorld4All : AnimeHttpSource() {
             return emptyList()
         }
 
-        val encodes = props.getJSONObject("data")
+        val media = props.getJSONObject("data")
             .getJSONObject("data")
-            .optJSONArray("encodes") ?: return emptyList()
 
         val videos = mutableListOf<Video>()
-        for (i in 0 until encodes.length()) {
-            val encode = encodes.getJSONObject(i)
-            val resolution = encode.optString("resolution")
-            val files = encode.optJSONArray("files") ?: continue
-            for (j in 0 until files.length()) {
-                // Isolate each host so a single malformed entry or dead link
-                // can never wipe out the whole episode's video list.
+
+        // 1. Site-hosted "Watch Online" streams (only populated for some titles).
+        media.optJSONArray("streams")?.let { streams ->
+            for (i in 0 until streams.length()) {
                 runCatching {
-                    val file = files.getJSONObject(j)
-                    val hostName = file.optString("host").ifBlank { "Host" }
-                    val fileLink = file.optString("link").ifBlank { return@runCatching }
-                    val redirectUrl = if (fileLink.startsWith("/")) "$archiveUrl$fileLink" else fileLink
+                    val stream = streams.getJSONObject(i)
+                    val playUrl = stream.optString("play").ifBlank { return@runCatching }
+                    val language = stream.optJSONArray("languages")
+                        ?.optJSONObject(0)?.optString("more")
+                        ?.ifBlank { null }
+                        ?: "Watch Online"
+                    videos += Video(playUrl, language, playUrl, headers)
+                }
+            }
+        }
 
-                    val hostUrl = resolveBridgeHops(redirectUrl) ?: return@runCatching
+        // 2. File-host mirrors (HubCloud / Filepress / GDFlix / MEGA).
+        media.optJSONArray("encodes")?.let { encodes ->
+            for (i in 0 until encodes.length()) {
+                val encode = encodes.getJSONObject(i)
+                val resolution = encode.optString("resolution")
+                val files = encode.optJSONArray("files") ?: continue
+                for (j in 0 until files.length()) {
+                    // Isolate each host so a single malformed entry or dead link
+                    // can never wipe out the whole episode's video list.
+                    runCatching {
+                        val file = files.getJSONObject(j)
+                        val hostName = file.optString("host").ifBlank { "Host" }
+                        val fileLink = file.optString("link").ifBlank { return@runCatching }
+                        val redirectUrl = if (fileLink.startsWith("/")) "$archiveUrl$fileLink" else fileLink
 
-                    if (hostName.contains("HubCloud", ignoreCase = true) || hostName.contains("GDFlix", ignoreCase = true)) {
-                        videos += deepExtractVideos(hostUrl, resolution, hostName)
-                    } else {
-                        videos += Video(hostUrl, "$resolution - $hostName (Portal)", hostUrl, headers)
+                        val hostUrl = resolveBridgeHops(redirectUrl) ?: return@runCatching
+
+                        // Hosts whose file page can expose the real stream URL.
+                        if (hostName.contains("HubCloud", ignoreCase = true) ||
+                            hostName.contains("GDFlix", ignoreCase = true) ||
+                            hostName.contains("Filepress", ignoreCase = true)
+                        ) {
+                            videos += deepExtractVideos(hostUrl, resolution, hostName)
+                        } else if (isHostFileAlive(hostUrl)) {
+                            videos += Video(hostUrl, "$resolution - $hostName (Portal)", hostUrl, headers)
+                        }
                     }
                 }
             }
@@ -187,6 +209,31 @@ class ToonWorld4All : AnimeHttpSource() {
                 .thenByDescending { it.quality.contains("720") }
                 .thenByDescending { !it.quality.contains("Portal") },
         )
+    }
+
+    /**
+     * Quick liveness check for host pages that are only emitted as "Portal"
+     * links. HubCloud has been dead for a while (every /drive/<id> returns
+     * 404 or a "File Not Found" body), so without this check users were being
+     * handed broken links that sorted to the top of the list. 403 (Cloudflare
+     * challenge) is treated as alive - the page can still render in a WebView.
+     */
+    private fun isHostFileAlive(url: String): Boolean {
+        return try {
+            val hostHeaders = headers.newBuilder()
+                .set("Referer", "$archiveUrl/")
+                .build()
+            client.newCall(GET(url, hostHeaders)).execute().use { resp ->
+                if (resp.code == 404 || resp.code == 410) return false
+                if (resp.code >= 500) return false
+                // Some hosts answer 200 with an error page (e.g. "404 ! File Not Found").
+                val bodyStart = resp.peekBody(128).string()
+                !bodyStart.contains("File Not Found", ignoreCase = true) &&
+                    !bodyStart.contains("404", ignoreCase = true)
+            }
+        } catch (e: Exception) {
+            false
+        }
     }
 
     /**
@@ -218,7 +265,13 @@ class ToonWorld4All : AnimeHttpSource() {
                 val domain = link?.optString("domain").orEmpty()
                 val hidden = link?.optString("hidden").orEmpty()
                 if (domain.isNotBlank() && hidden.isNotBlank()) {
-                    return domain.trimEnd('/') + "/" + hidden.trimStart('/')
+                    var hostUrl = domain.trimEnd('/') + "/" + hidden.trimStart('/')
+                    // GDFlix migrated from gdflix.dev to gdflix.io; the archive's
+                    // link table still carries the old domain, which only 302s.
+                    if (hostUrl.contains("gdflix.dev")) {
+                        hostUrl = hostUrl.replace("gdflix.dev", "new3.gdflix.io")
+                    }
+                    return hostUrl
                 }
                 val destination = props.optString("destination")
                 if (destination.isNotBlank()) return destination.replace("\\/", "/")
@@ -229,8 +282,10 @@ class ToonWorld4All : AnimeHttpSource() {
     }
 
     /**
-     * Some file hosts (HubCloud / GDFlix) expose the real stream URL in their
-     * page markup. Try to grab it; otherwise fall back to opening the host page.
+     * Some file hosts (HubCloud / GDFlix / Filepress) expose the real stream URL
+     * in their page markup. Try to grab it; otherwise fall back to opening the
+     * host page. Dead pages (404 / "File Not Found") yield nothing at all so a
+     * dead host can never surface a broken video entry.
      */
     private fun deepExtractVideos(hostUrl: String, res: String, hostName: String): List<Video> {
         val hostHeaders = headers.newBuilder()
@@ -238,15 +293,23 @@ class ToonWorld4All : AnimeHttpSource() {
             .build()
 
         client.newCall(GET(hostUrl, hostHeaders)).execute().use { response ->
+            if (response.code == 404 || response.code == 410 || response.code >= 500) {
+                return emptyList()
+            }
             val html = response.body.string()
+            if (html.contains("File Not Found", ignoreCase = true)) {
+                return emptyList()
+            }
 
             val tokRegex = Regex("""href="([^"]+tok=[^"]+)"""", RegexOption.DOT_MATCHES_ALL)
             val downloadRegex = Regex("""\"([^"]+/download/[^"]+)\"""", RegexOption.DOT_MATCHES_ALL)
             val fileRegex = Regex("""file:\s*\"([^"]+)\"""", RegexOption.DOT_MATCHES_ALL)
+            val sourceRegex = Regex("""<source[^>]+src=\"([^\"]+)\"""", RegexOption.DOT_MATCHES_ALL)
 
             val streamUrl = tokRegex.find(html)?.groupValues?.get(1)
                 ?: downloadRegex.find(html)?.groupValues?.get(1)
                 ?: fileRegex.find(html)?.groupValues?.get(1)
+                ?: sourceRegex.find(html)?.groupValues?.get(1)
 
             return if (streamUrl != null && !streamUrl.contains("/video/") && !streamUrl.contains("/file/")) {
                 listOf(Video(streamUrl, "$res - $hostName", streamUrl, headers = hostHeaders))
