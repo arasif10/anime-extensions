@@ -434,13 +434,35 @@ class Hanime : AnimeHttpSource() {
 
     override fun animeDetailsParse(response: Response): SAnime {
         val document = Jsoup.parse(response.body.string())
+
+        // The details page lists every episode of the series (plus related videos
+        // from other series). Count the entries sharing this series' base slug so
+        // we only strip the trailing episode number from multi-episode series
+        // titles ("Sister Breeder 1" -> "Sister Breeder") and never from a
+        // standalone video whose name legitimately ends in a number.
+        val slug = response.request.url.toString()
+            .substringBefore("?")
+            .substringAfterLast("/")
+        val base = baseSlug(slug)
+        val seriesEpisodeCount = document.select("[data-video-href*=/videos/hentai/]")
+            .mapNotNull { element ->
+                element.attr("data-video-href")
+                    .substringBefore("?")
+                    .substringAfterLast("/")
+                    .ifBlank { null }
+            }
+            .distinct()
+            .count { baseSlug(it) == base }
+
+        val rawTitle = document.selectFirst("h1")?.text()
+            ?: document.selectFirst("meta[property=og:title]")?.attr("content")
+                ?.substringAfter("Watch ")
+                ?.substringBefore(" Hentai Video")
+                ?.trim()
+            ?: ""
+
         return SAnime.create().apply {
-            title = document.selectFirst("h1")?.text()
-                ?: document.selectFirst("meta[property=og:title]")?.attr("content")
-                    ?.substringAfter("Watch ")
-                    ?.substringBefore(" Hentai Video")
-                    ?.trim()
-                ?: ""
+            title = if (seriesEpisodeCount > 1) seriesTitle(rawTitle) else rawTitle
 
             thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("content")
                 ?: document.selectFirst("img.hvpi-cover, img.cover")?.attr("src")
