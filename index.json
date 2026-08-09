@@ -36,5 +36,24 @@
         "baseUrl": "https://toonworld4all.me"
       }
     ]
+  },
+  {
+    "name": "MovieBox",
+    "pkg": "eu.kanade.tachiyomi.animeextension.all.moviebox",
+    "apk": "aniyomi-all.moviebox-v14.1131-release.apk",
+    "lang": "all",
+    "code": 1131,
+    "version": "14.1131",
+    "nsfw": 0,
+    "hasReadme": 0,
+    "hasChangelog": 0,
+    "sources": [
+      {
+        "id": 3508466391484419848,
+        "lang": "all",
+        "name": "MovieBox",
+        "baseUrl": "https://moviebox.ph"
+      }
+    ]
   }
 ]
