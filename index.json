@@ -55,5 +55,24 @@
         "baseUrl": "https://moviebox.ph"
       }
     ]
+  },
+  {
+    "name": "AR Asif",
+    "pkg": "eu.kanade.tachiyomi.animeextension.all.toonhub4u",
+    "apk": "aniyomi-all.toonhub4u-v14.01-release.apk",
+    "lang": "all",
+    "code": 1,
+    "version": "14.01",
+    "nsfw": 0,
+    "hasReadme": 0,
+    "hasChangelog": 0,
+    "sources": [
+      {
+        "id": 2128601802998256037,
+        "lang": "all",
+        "name": "ToonHub4u",
+        "baseUrl": "https://toonhub4u.co"
+      }
+    ]
   }
 ]
