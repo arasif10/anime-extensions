@@ -2,10 +2,10 @@
   {
     "name": "AR Asif",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.hanime",
-    "apk": "aniyomi-all.hanime-v14.11-release.apk",
+    "apk": "aniyomi-all.hanime-v14.12-release.apk",
     "lang": "all",
-    "code": 11,
-    "version": "14.11",
+    "code": 12,
+    "version": "14.12",
     "nsfw": 0,
     "hasReadme": 0,
     "hasChangelog": 0,
