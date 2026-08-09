@@ -53,3 +53,30 @@ jobs:
         with:
           name: extension-apk
           path: '**/build/outputs/apk/**/*.apk'
+
+  publish:
+    # Publish the freshly built APKs to the public arasif10/extensions repo so
+    # AniZen users can update. Needs EXTENSIONS_REPO_TOKEN (a PAT with write
+    # access to arasif10/extensions) stored in this repo's secrets.
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ secrets.EXTENSIONS_REPO_TOKEN != '' }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download built APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: extension-apk
+          path: apks
+
+      - name: Clone extensions repo
+        run: |
+          git clone --quiet --branch repo \
+            "https://x-access-token:${{ secrets.EXTENSIONS_REPO_TOKEN }}@github.com/arasif10/extensions.git" \
+            extensions-repo
+
+      - name: Publish APKs and update index
+        run: python .github/publish_extensions.py --apk-dir apks --extensions-repo extensions-repo
