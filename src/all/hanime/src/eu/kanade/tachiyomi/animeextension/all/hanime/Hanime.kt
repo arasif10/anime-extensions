@@ -597,7 +597,23 @@ class Hanime : AnimeHttpSource() {
                     ?: document.selectFirst("meta[property=og:description]")?.attr("content")
             }
 
-            genre = document.select("a[href*=/browse/tags/]").joinToString(", ") { it.text() }
+            // The video's own tags come from the catalog, which matches the tag row
+            // shown on hanime.tv exactly. The details page also contains tag
+            // *category* links ("Incest Hentai", "Milf Hentai", ...) elsewhere in
+            // the layout, so selecting every a[href*=/browse/tags/] over-collects.
+            val catalogTags = runCatching {
+                getCatalog()
+                    .filter { baseSlug(it.slug) == base }
+                    .flatMap { it.tags }
+                    .distinct()
+                    .joinToString(", ")
+            }.getOrNull()
+
+            genre = if (!catalogTags.isNullOrBlank()) {
+                catalogTags
+            } else {
+                document.select("a[href*=/browse/tags/]").joinToString(", ") { it.text() }
+            }
             author = document.selectFirst("a[href*=/browse/brands/] strong")?.text()
                 ?: document.selectFirst("a[href*=/browse/brands/]")?.text()
                     ?.removePrefix("Studio")
