@@ -315,7 +315,9 @@ class ToonHub4u : AnimeHttpSource() {
                     decoded = decoded.replace(Regex("\\b" + toBase36(i) + "\\b"), dict[i])
                 }
             }
-            val fileMatch = Regex(""""file"\s*:\s*"([^"]*(?:m3u8|\.mp4)[^"]*)"""").find(decoded)
+            // The player config keys may be quoted or not ("file": or file:),
+            // depending on how the site packs it, so accept both.
+            val fileMatch = Regex("""["']?file["']?\s*:\s*"([^"]*(?:m3u8|\.mp4)[^"]*)"""").find(decoded)
             if (fileMatch != null) {
                 return fileMatch.groupValues[1]
             }
@@ -342,7 +344,7 @@ class ToonHub4u : AnimeHttpSource() {
                         decoded = decoded.replace(Regex("\\b" + toBase36(i) + "\\b"), dict[i])
                     }
                 }
-                val tracks = Regex("""file"\s*:\s*"([^"]+\.vtt)"[^}]*?label"\s*:\s*"([^"]*)"""", RegexOption.DOT_MATCHES_ALL)
+                val tracks = Regex("""["']?file["']?\s*:\s*"([^"]+\.vtt)"[^}]*?["']?label["']?\s*:\s*"([^"]*)"""", RegexOption.DOT_MATCHES_ALL)
                     .findAll(decoded)
                 tracks.forEach { m ->
                     out.add(Pair(m.groupValues[2], m.groupValues[1]))
