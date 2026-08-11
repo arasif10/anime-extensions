@@ -211,6 +211,69 @@ class Hanime : AnimeHttpSource() {
     }
 
     /**
+     * The search API's `search_titles` field concatenates every known name of a
+     * video in several scripts without separators (e.g. "...Website of Darkness
+     * ヤバい! -復讐・闇サイト- 위험해! -복수・암흑 Site- 危机！-复仇·暗黑网站").
+     * Splits it back into the distinct alternative names, dropping the main
+     * title itself.
+     */
+    private fun extractAlternativeNames(searchTitles: String, name: String): List<String> {
+        val raw = Jsoup.parse(searchTitles).text().trim()
+        if (raw.isBlank()) return emptyList()
+
+        // Remove occurrences of the main title and its episode-less form so the
+        // remaining text contains only the "other" names.
+        var cleaned = raw.replace('\u3000', ' ')
+        for (variant in listOf(name.trim(), seriesTitle(name))) {
+            if (variant.isNotBlank() && variant.length >= 3) {
+                cleaned = cleaned.replace(variant, " ", ignoreCase = true)
+            }
+        }
+
+        // Split wherever the writing script changes; punctuation, spaces and
+        // symbols extend the current segment instead of starting a new one.
+        // Kanji (CJK ideographs) embedded in a kana run (e.g. "ヤバい! -復讐・闇サイト-")
+        // extend that run rather than splitting it.
+        val segments = mutableListOf<String>()
+        val current = StringBuilder()
+        var currentClass = -1
+        for (c in cleaned) {
+            var cls = scriptClass(c)
+            if (cls == 3 && currentClass == 1) cls = 1
+            if (cls >= 0 && currentClass >= 0 && cls != currentClass) {
+                segments.add(current.toString().trim())
+                current.setLength(0)
+            }
+            current.append(c)
+            if (cls >= 0) currentClass = cls
+        }
+        if (current.isNotBlank()) segments.add(current.toString().trim())
+
+        return segments
+            .map { it.trim().trim(' ', '-', ':', ';', ',', '!', '?', '(', ')', '\u3000', '\u00A0') }
+            .filter { it.length >= 2 }
+            .filter { segment ->
+                // Keep multi-word English variants but drop stray single tokens
+                // left over from mixed-script names (e.g. "Site-") and
+                // repeated placeholder text such as "OVA OVA".
+                val purelyLatin = segment.all { scriptClass(it) == 0 || it == '-' }
+                val words = segment.split(" ").filter { it.isNotBlank() }
+                !purelyLatin || (words.size >= 2 && words.distinct().size > 1)
+            }
+            .filterNot { it.equals(name, ignoreCase = true) }
+            .distinct()
+            .take(8)
+    }
+
+    private fun scriptClass(c: Char): Int = when {
+        c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9' -> 0
+        c in '\u3040'..'\u30FA' -> 1
+        c in '\uAC00'..'\uD7AF' || c in '\u1100'..'\u11FF' -> 2
+        c in '\u4E00'..'\u9FFF' -> 3
+        else -> -1
+    }
+
+    /**
      * Groups catalog entries into series by their base slug, keeping the lowest
      * episode as the series representative so each series shows up only once.
      * The representative's title is cleaned to the bare series name when the
@@ -467,8 +530,10 @@ class Hanime : AnimeHttpSource() {
             thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("content")
                 ?: document.selectFirst("img.hvpi-cover, img.cover")?.attr("src")
 
-            // Extract real clean synopsis by filtering out SEO / site UI text
-            val synopsisParagraphs = document.select("p").mapNotNull { p ->
+            // The real synopsis lives in its own container (div[data-expand-content]);
+            // the site-wide SEO / promo paragraphs ("Our fans' community Discord...",
+            // "What is Hentai?...") appear elsewhere on the page and are skipped.
+            val synopsisParagraphs = document.select("div[data-expand-content] p").mapNotNull { p ->
                 val text = p.text().trim()
                 if (
                     text.length > 20 &&
@@ -488,8 +553,24 @@ class Hanime : AnimeHttpSource() {
                 }
             }
 
+            // Alternative names (English variants + Japanese/Korean/Chinese titles)
+            // come from the search API's search_titles field, looked up through the
+            // cached catalog using this series' base slug. They are shown in the
+            // description and are already matched by catalog searches.
+            val alternativeNames = runCatching {
+                getCatalog()
+                    .filter { baseSlug(it.slug) == base }
+                    .flatMap { extractAlternativeNames(it.searchTitles, it.name) }
+                    .distinct()
+            }.getOrDefault(emptyList())
+
             description = if (synopsisParagraphs.isNotEmpty()) {
-                synopsisParagraphs.joinToString("\n\n")
+                val synopsis = synopsisParagraphs.joinToString("\n\n")
+                if (alternativeNames.isNotEmpty()) {
+                    "$synopsis\n\nAlternative names: ${alternativeNames.joinToString(", ")}"
+                } else {
+                    synopsis
+                }
             } else {
                 document.selectFirst("meta[name=description]")?.attr("content")
                     ?: document.selectFirst("meta[property=og:description]")?.attr("content")
