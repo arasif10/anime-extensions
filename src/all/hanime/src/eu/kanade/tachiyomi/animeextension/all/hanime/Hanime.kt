@@ -422,7 +422,16 @@ class Hanime : AnimeHttpSource() {
             }
         }
 
-        val genreFilters = filters.filterIsInstance<GenreFilter>()
+        // Genres and studios live inside collapsible Groups, so flatten the
+        // group children before looking for their filter instances.
+        val flatFilters = filters.flatMap { filter ->
+            if (filter is AnimeFilter.Group<*>) {
+                filter.state.filterIsInstance<AnimeFilter<*>>()
+            } else {
+                listOf(filter)
+            }
+        }
+        val genreFilters = flatFilters.filterIsInstance<GenreFilter>()
         val includedGenres = genreFilters
             .filter { it.state == AnimeFilter.TriState.STATE_INCLUDE }
             .map { it.name.lowercase() }
@@ -436,7 +445,7 @@ class Hanime : AnimeHttpSource() {
             }
         }
 
-        val studioFilters = filters.filterIsInstance<StudioFilter>()
+        val studioFilters = flatFilters.filterIsInstance<StudioFilter>()
         val includedStudios = studioFilters
             .filter { it.state == AnimeFilter.TriState.STATE_INCLUDE }
             .map { it.name.lowercase() }
