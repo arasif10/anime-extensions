@@ -436,6 +436,20 @@ class Hanime : AnimeHttpSource() {
             }
         }
 
+        val studioFilters = filters.filterIsInstance<StudioFilter>()
+        val includedStudios = studioFilters
+            .filter { it.state == AnimeFilter.TriState.STATE_INCLUDE }
+            .map { it.name.lowercase() }
+        val excludedStudios = studioFilters
+            .filter { it.state == AnimeFilter.TriState.STATE_EXCLUDE }
+            .map { it.name.lowercase() }
+        if (includedStudios.isNotEmpty() || excludedStudios.isNotEmpty()) {
+            list = list.filter { entry ->
+                val brand = (entry.brand ?: "").trim().lowercase()
+                includedStudios.all { brand == it } && excludedStudios.none { brand == it }
+            }
+        }
+
         val yearFilter = filters.filterIsInstance<YearFilter>().firstOrNull()
         val year = yearFilter?.state?.let { YEAR_VALUES.getOrNull(it) }
         if (year != null && year != "All") {
@@ -460,15 +474,22 @@ class Hanime : AnimeHttpSource() {
     }
 
     // ============================== Filters ==============================
+    private class FilterGroup(name: String, vararg filters: AnimeFilter<*>) :
+        AnimeFilter.Group<AnimeFilter<*>>(name, filters.toList())
+
     private class GenreFilter(name: String) : AnimeFilter.TriState(name, AnimeFilter.TriState.STATE_IGNORE)
+
+    private class StudioFilter(name: String) : AnimeFilter.TriState(name, AnimeFilter.TriState.STATE_IGNORE)
 
     private class YearFilter : AnimeFilter.Select<String>("Release Year", YEAR_VALUES, 0)
 
     private class SortFilter : AnimeFilter.Select<String>("Sorting", SORT_VALUES, 0)
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
-        AnimeFilter.Header("Genres"),
-        *GENRES.map { GenreFilter(it) }.toTypedArray(),
+        // Groups render as collapsible sections in AniZen (closed by default),
+        // unlike a plain list of TriState filters which stays expanded.
+        FilterGroup("Genres", *GENRES.map { GenreFilter(it) }.toTypedArray()),
+        FilterGroup("Studios", *STUDIOS.map { StudioFilter(it) }.toTypedArray()),
         AnimeFilter.Header("Release Year"),
         YearFilter(),
         AnimeFilter.Header("Sorting"),
@@ -836,6 +857,17 @@ class Hanime : AnimeHttpSource() {
 
     // ============================== Filter data ==============================
     companion object {
+        private val STUDIOS = listOf(
+            "Pink Pineapple", "MS Pictures", "PoRO", "Queen Bee",
+            "Vanilla", "Bunnywalker", "Green Bunny", "Anime Antenna Iinkai",
+            "Suzuki Mirano", "Mary Jane", "Magin Label", "Discovery",
+            "nur", "MediaBank", "Collaboration Works", "NuTech Digital",
+            "Five Ways", "New Generation", "Showten", "T-Rex",
+            "Central Park Media", "Antechinus", "ChiChinoya", "SELFISH",
+            "Edge", "Media Blasters", "Passione", "Milky",
+            "Pashmina", "Daiei",
+        )
+
         private val GENRES = listOf(
             "3D", "Ahegao", "Anal", "BDSM", "Big Boobs", "Blow Job", "Boob Job", "Bondage",
             "Censored", "Comedy", "Cosplay", "Creampie", "Dark Skin", "Fantasy", "Facial",
