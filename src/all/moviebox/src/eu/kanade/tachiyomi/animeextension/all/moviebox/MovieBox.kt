@@ -41,7 +41,7 @@ import javax.crypto.spec.SecretKeySpec
 
 class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
 
-    override val name = "MovieBox"
+    override val name = "MovieBox (𝕬𝕽)"
 
     override val baseUrl = "https://moviebox.ph"
 

@@ -28,7 +28,7 @@ import javax.crypto.spec.SecretKeySpec
 
 class Hanime : AnimeHttpSource() {
 
-    override val name = "Hanime"
+    override val name = "Hanime (𝕬𝕽)"
 
     override val baseUrl = "https://hanime.tv"
 

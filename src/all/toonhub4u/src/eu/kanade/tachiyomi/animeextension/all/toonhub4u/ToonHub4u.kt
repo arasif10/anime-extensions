@@ -19,7 +19,7 @@ import rx.Observable
 
 class ToonHub4u : AnimeHttpSource() {
 
-    override val name = "ToonHub4u"
+    override val name = "ToonHub4u (𝕬𝕽)"
 
     override val baseUrl = "https://toonhub4u.co"
 
