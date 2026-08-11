@@ -574,15 +574,25 @@ class Hanime : AnimeHttpSource() {
                 }
             }
 
-            // Alternative names (English variants + Japanese/Korean/Chinese titles)
-            // come from the search API's search_titles field, looked up through the
-            // cached catalog using this series' base slug. They are shown in the
-            // description and are already matched by catalog searches.
+            // Alternative names come straight from the page's "Alternate Names"
+            // section (one chip per name, e.g. "Custom Dorei", "Custom Reido",
+            // "Custom Slave", ...). That is far more reliable than re-splitting
+            // the search API's concatenated search_titles field, which merges
+            // consecutive Latin names ("Custom Dorei Custom Reido Custom Slave")
+            // and drops names that match the episode-less title. Fall back to the
+            // catalog-based splitter only when the page has no such section.
             val alternativeNames = runCatching {
-                getCatalog()
-                    .filter { baseSlug(it.slug) == base }
-                    .flatMap { extractAlternativeNames(it.searchTitles, it.name) }
+                val pageNames = document.select("div[data-expand-content] h3")
+                    .mapNotNull { it.text().trim().ifBlank { null } }
                     .distinct()
+                if (pageNames.isNotEmpty()) {
+                    pageNames
+                } else {
+                    getCatalog()
+                        .filter { baseSlug(it.slug) == base }
+                        .flatMap { extractAlternativeNames(it.searchTitles, it.name) }
+                        .distinct()
+                }
             }.getOrDefault(emptyList())
 
             description = if (synopsisParagraphs.isNotEmpty()) {
