@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.animeextension.all.toonhub4u
 
+import android.util.Base64
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
@@ -14,6 +15,7 @@ import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import rx.Observable
 
@@ -102,9 +104,15 @@ class ToonHub4u : AnimeHttpSource() {
             title = cleanTitle(document.selectFirst("h1.entry-title")?.text().orEmpty())
             thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("content")
                 ?: document.selectFirst("div.entry-content img")?.attr("src")
-            description = document.select("div.entry-content p").joinToString("\n\n") { it.text() }
-                .replace(Regex("""(?s)\s*Download.*"""), "")
-                .trim()
+            // The entry-content also contains every episode's download blocks;
+            // keep only the real info: the metadata paragraph and the synopsis.
+            val meta = document.select("div.entry-content p").firstOrNull {
+                it.text().trim().startsWith("Genre:")
+            }?.text()?.trim()
+            val synopsis = document.select("div.entry-content p").firstOrNull {
+                it.text().trim().startsWith("Synopsis:", ignoreCase = true)
+            }?.text()?.trim()?.substringAfter(":")?.trim()
+            description = listOfNotNull(synopsis, meta).joinToString("\n\n")
             genre = document.select("span.post-categories a").joinToString { it.text() }
             status = SAnime.UNKNOWN
         }
@@ -179,11 +187,10 @@ class ToonHub4u : AnimeHttpSource() {
             videos += resolveStreamServers(slug, season, epNum)
         }
 
-        // Fallback: the post's download links (GDrive mirror pages) for this
-        // episode, so the list is never empty even when ToonStream is down.
-        if (videos.isEmpty()) {
-            videos += resolveDownloadLinks(postUrl, epNum)
-        }
+        // The post's download links are multi-server mirror pages (Filemoon,
+        // streamhg, krakenfiles, ...). Resolve them into playable streams so
+        // the list offers more than just the ToonStream servers.
+        videos += resolveMirrorStreams(postUrl, epNum)
 
         return videos
     }
@@ -249,7 +256,7 @@ class ToonHub4u : AnimeHttpSource() {
         return videos
     }
 
-    private fun resolveDownloadLinks(postUrl: String, epNum: String): List<Video> {
+    private fun resolveMirrorStreams(postUrl: String, epNum: String): List<Video> {
         val videos = mutableListOf<Video>()
         runCatching {
             val doc = client.newCall(GET(postUrl, headers)).execute().use { response ->
@@ -257,6 +264,7 @@ class ToonHub4u : AnimeHttpSource() {
             }
             val content = doc.selectFirst(".entry-content") ?: doc
             var currentEp = 0
+            val mirrorLinks = mutableListOf<String>()
             content.select("strong, b, a").forEach { el ->
                 when {
                     el.tagName() == "strong" || el.tagName() == "b" -> {
@@ -267,30 +275,92 @@ class ToonHub4u : AnimeHttpSource() {
                     el.tagName() == "a" -> {
                         val href = el.attr("href")
                         if (href.contains("gdmirrorbot") && currentEp.toString() == epNum) {
-                            val res = el.parent()?.ownText()?.trim().orEmpty()
-                            val finalUrl = resolveRedirect(href)
-                            videos += Video(
-                                finalUrl,
-                                "Download ${res.ifBlank { "GDrive" }} (GDrive)",
-                                finalUrl,
-                                headers = headers,
-                            )
+                            mirrorLinks += href
                         }
                     }
                 }
             }
+            // The last mirror link of the episode is the highest quality
+            // (the site lists 480p, 720p, 1080p in order).
+            mirrorLinks.lastOrNull()?.let { resolveMirrorPage(it, videos) }
         }
         return videos
     }
 
-    private fun resolveRedirect(url: String): String {
-        return try {
-            client.newCall(GET(url, headers)).execute().use { resp ->
+    /**
+     * The gdmirrorbot link redirects to a file page whose player is backed by
+     * an API (`/embedhelper2.php`) that lists several mirror embeds (Filemoon,
+     * streamhg, krakenfiles, earnvids, streamp2p). Resolve the first few into
+     * playable media URLs; JS-only mirrors are skipped silently.
+     */
+    private fun resolveMirrorPage(mirrorLink: String, videos: MutableList<Video>) {
+        runCatching {
+            val pageUrl = client.newCall(GET(mirrorLink, headers)).execute().use { resp ->
                 resp.request.url.toString()
             }
-        } catch (e: Exception) {
-            url
+            val pageHtml = client.newCall(GET(pageUrl, headers)).execute().use { it.body.string() }
+            val sid = Regex("""(?:videoId|gdmrfid)\s*=\s*"([^"]+)"""").find(pageHtml)?.groupValues?.get(1)
+                ?: pageUrl.substringAfterLast("/").substringBefore("?")
+            val apiUrl = Regex("""(https?://[^/"]+)""").find(pageHtml)?.groupValues?.get(1)?.let {
+                "$it/embedhelper2.php"
+            } ?: "${pageUrl.substringBeforeLast("/")}/embedhelper2.php"
+
+            val apiBody = client.newCall(
+                Request.Builder()
+                    .url(apiUrl)
+                    .post(FormBody.Builder().add("sid", sid).build())
+                    .headers(headers.newBuilder().set("Referer", pageUrl).build())
+                    .build(),
+            ).execute().use { it.body.string() }
+            val json = JSONObject(apiBody)
+            val sources = json.optJSONObject("sources") ?: return@runCatching
+            val ids = runCatching {
+                JSONObject(String(Base64.decode(json.optString("mresult"), Base64.DEFAULT), Charsets.UTF_8))
+            }.getOrNull() ?: return@runCatching
+
+            val keys = sources.keys().asSequence().toList()
+            keys.take(3).forEach { key ->
+                runCatching {
+                    val src = sources.getJSONObject(key)
+                    val siteUrl = src.optString("siteUrl").trim().trimEnd('/') + "/"
+                    val fileId = ids.optString(key)
+                    if (siteUrl == "/" || fileId.isBlank()) return@runCatching
+                    val friendly = src.optString("friendlyName").ifBlank { key }
+                    val streamUrl = extractStreamFromEmbed("$siteUrl$fileId", pageUrl) ?: return@runCatching
+                    videos += Video(streamUrl, friendly, streamUrl, headers = headers)
+                }
+            }
         }
+    }
+
+    /**
+     * Follows an embed page (redirects plus one iframe hop) and returns the
+     * first playable media URL found, or null for JS-only players.
+     */
+    private fun extractStreamFromEmbed(embedUrl: String, referer: String): String? {
+        val h = headers.newBuilder().set("Referer", referer).build()
+        val mediaInBody = Regex("""https?://[^"'\s<>]*(?:\.m3u8|\.mp4|\.mkv)(?:[?&][^"'\s<>]*)?""", RegexOption.IGNORE_CASE)
+        val mediaExt = Regex("""\.(?:m3u8|mp4|mkv)(?:\?|$)""", RegexOption.IGNORE_CASE)
+        fun mediaFrom(url: String, body: String): String? {
+            mediaInBody.find(body)?.let { return it.value }
+            return if (mediaExt.containsMatchIn(url)) url else null
+        }
+        return runCatching {
+            client.newCall(GET(embedUrl, h)).execute().use { resp ->
+                val firstUrl = resp.request.url.toString()
+                val firstBody = resp.body.string()
+                mediaFrom(firstUrl, firstBody) ?: run {
+                    val frame = Regex("""<iframe[^>]*src="([^"]+)""", RegexOption.IGNORE_CASE)
+                        .find(firstBody)?.groupValues?.get(1) ?: return@runCatching null
+                    val next = if (frame.startsWith("http")) frame else "${embedUrl.substringBeforeLast("/")}/$frame"
+                    client.newCall(GET(next, h)).execute().use { r2 ->
+                        val secondUrl = r2.request.url.toString()
+                        val secondBody = r2.body.string()
+                        mediaFrom(secondUrl, secondBody)
+                    }
+                }
+            }
+        }.getOrNull()
     }
 
     /**
