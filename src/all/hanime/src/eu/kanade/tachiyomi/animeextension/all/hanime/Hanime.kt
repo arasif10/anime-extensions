@@ -647,6 +647,18 @@ class Hanime : AnimeHttpSource() {
             .substringAfterLast("/")
         val base = baseSlug(slug)
 
+        // Per-episode release dates from the cached search catalog. AniZen shows
+        // each episode's date_upload in the list, so use the original release
+        // date (released_at_unix) rather than the hanime upload date. The map is
+        // only read from an already-cached catalog so this path never triggers
+        // the multi-megabyte catalog download.
+        val releaseDates = if (catalogFresh()) {
+            runCatching { getCatalog().associate { it.slug to it.releasedAt } }
+                .getOrDefault(emptyMap())
+        } else {
+            emptyMap()
+        }
+
         val seen = HashSet<String>()
         val episodes = mutableListOf<SEpisode>()
 
@@ -666,6 +678,8 @@ class Hanime : AnimeHttpSource() {
                     name = if (number > 0) "Episode $number" else epSlug
                     episode_number = number.toFloat().coerceAtLeast(1f)
                     url = "/videos/hentai/$epSlug"
+                    // The API returns unix seconds; date_upload is epoch millis.
+                    date_upload = (releaseDates[epSlug] ?: 0L) * 1000
                 },
             )
         }
@@ -681,6 +695,7 @@ class Hanime : AnimeHttpSource() {
                     name = if (fallbackNumber > 0) "Episode $fallbackNumber" else "Episode 1"
                     episode_number = fallbackNumber.toFloat().coerceAtLeast(1f)
                     url = "/videos/hentai/$slug"
+                    date_upload = (releaseDates[slug] ?: 0L) * 1000
                 },
             )
         }
