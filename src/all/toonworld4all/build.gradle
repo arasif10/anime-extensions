@@ -1,7 +1,8 @@
 ext {
     extName = 'ToonWorld4All'
+    extLabel = 'ToonWorld4All (𝕬𝕽)'
     extClass = '.ToonWorld4All'
-    extVersionCode = 9
+    extVersionCode = 10
 }
 
 apply from: "$rootDir/common.gradle"

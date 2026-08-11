@@ -42,8 +42,9 @@ android {
             archivesName = "aniyomi-$applicationIdSuffix-v$versionName"
         }
         assert extClass.startsWith(".")
+        def displayName = project.ext.has("extLabel") ? project.ext.get("extLabel") : extName
         manifestPlaceholders = [
-                appName : "Aniyomi: $extName",
+                appName : "Aniyomi: $displayName",
                 extClass: extClass,
                 nsfw    : project.ext.find("isNsfw") ? 1 : 0,
         ]
