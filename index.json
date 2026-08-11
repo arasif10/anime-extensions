@@ -2,10 +2,10 @@
   {
     "name": "Hanime (𝕬𝕽)",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.hanime",
-    "apk": "aniyomi-all.hanime-v14.19-release.apk",
+    "apk": "aniyomi-all.hanime-v14.20-release.apk",
     "lang": "all",
-    "code": 19,
-    "version": "14.19",
+    "code": 20,
+    "version": "14.20",
     "nsfw": 0,
     "hasReadme": 0,
     "hasChangelog": 0,
