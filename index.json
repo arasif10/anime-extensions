@@ -1,6 +1,6 @@
 [
   {
-    "name": "AR Asif",
+    "name": "Hanime (𝕬𝕽)",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.hanime",
     "apk": "aniyomi-all.hanime-v14.19-release.apk",
     "lang": "all",
@@ -19,7 +19,7 @@
     ]
   },
   {
-    "name": "ToonWorld4All",
+    "name": "ToonWorld4All (𝕬𝕽)",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.toonworld4all",
     "apk": "aniyomi-all.toonworld4all-v14.09-release.apk",
     "lang": "all",
@@ -38,7 +38,7 @@
     ]
   },
   {
-    "name": "MovieBox",
+    "name": "MovieBox (𝕬𝕽)",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.moviebox",
     "apk": "aniyomi-all.moviebox-v14.19-release.apk",
     "lang": "all",
@@ -57,7 +57,7 @@
     ]
   },
   {
-    "name": "AR Asif",
+    "name": "ToonHub4u (𝕬𝕽)",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.toonhub4u",
     "apk": "aniyomi-all.toonhub4u-v14.07-release.apk",
     "lang": "all",
