@@ -37,6 +37,9 @@ class ToonHub4u : AnimeHttpSource() {
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
         .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
         .add("Accept-Language", "en-US,en;q=0.9")
+        // The app fetches thumbnails with these headers (no browser Referer),
+        // and i.ibb.co hotlink protection requires a toonhub4u.co referer.
+        .add("Referer", "$baseUrl/")
 
     // ============================== Popular / Latest ==============================
     override fun popularAnimeRequest(page: Int): Request {
