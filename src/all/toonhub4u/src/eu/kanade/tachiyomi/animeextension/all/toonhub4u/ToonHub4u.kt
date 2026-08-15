@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.animeextension.all.toonhub4u
 
-import android.util.Base64
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
@@ -15,7 +14,6 @@ import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
-import org.json.JSONObject
 import org.jsoup.Jsoup
 import rx.Observable
 
@@ -57,7 +55,7 @@ class ToonHub4u : AnimeHttpSource() {
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
         val genre = filters.find { it is GenreFilter } as? GenreFilter
         if (query.isBlank() && genre != null && genre.state > 0) {
-            return GET("$baseUrl/category/${genre.toSlug()}/page/$page/", headers)
+            return GET("$baseUrl/category/${genre.toPath()}/page/$page/", headers)
         }
         val url = "$baseUrl/page/$page/".toHttpUrl().newBuilder()
             .addQueryParameter("s", query)
@@ -73,14 +71,18 @@ class ToonHub4u : AnimeHttpSource() {
             val link = item.selectFirst("a.post-thumb") ?: return@mapNotNull null
             val url = link.attr("href")
             if (url.isBlank()) return@mapNotNull null
+            val img = link.selectFirst("img")
             SAnime.create().apply {
                 title = item.selectFirst("h2.post-title a")?.text()
-                    ?: link.selectFirst("img")?.attr("alt")
+                    ?: img?.attr("alt")
                     ?: return@mapNotNull null
                 // Site titles carry a trailing "Download 480p, 720p & 1080p ..." tag.
                 this.title = cleanTitle(title)
                 this.url = url
-                thumbnail_url = link.selectFirst("img")?.attr("src")
+                // FIFU lazy-loads some images; fall back to data-src when src is empty.
+                thumbnail_url = img?.attr("src")?.takeIf { it.isNotBlank() }
+                    ?: img?.attr("data-src")
+                    ?: img?.attr("data-lazy-src")
             }
         }
         val hasNextPage = document.select("li.the-next-page").isNotEmpty()
@@ -104,6 +106,7 @@ class ToonHub4u : AnimeHttpSource() {
             title = cleanTitle(document.selectFirst("h1.entry-title")?.text().orEmpty())
             thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("content")
                 ?: document.selectFirst("div.entry-content img")?.attr("src")
+                ?: document.selectFirst("div.entry-content img")?.attr("data-src")
             // The entry-content also contains every episode's download blocks;
             // keep only the real info: the metadata paragraph and the synopsis.
             val meta = document.select("div.entry-content p").firstOrNull {
@@ -202,18 +205,21 @@ class ToonHub4u : AnimeHttpSource() {
             .set("Referer", "$streamBase/")
             .build()
 
+        // Only the first iframe carries a plain `src`; the rest lazy-load
+        // through `data-src`, so read both. Skip the YouTube trailer embed.
         val embeds = try {
             client.newCall(GET(episodePageUrl, streamHeaders)).execute().use { response ->
                 val doc = Jsoup.parse(response.body.string())
-                doc.select("iframe[src]").mapNotNull {
-                    it.attr("src").takeIf { src -> src.startsWith("/embed/") }
+                doc.select("iframe").mapNotNull { frame ->
+                    val src = frame.attr("src").ifBlank { frame.attr("data-src") }
+                    src.takeIf { it.startsWith("/embed/") }
                 }
             }
         } catch (e: Exception) {
             emptyList()
         }
 
-        embeds.take(3).forEachIndexed { index, embedPath ->
+        embeds.take(6).forEachIndexed { index, embedPath ->
             runCatching {
                 val embedUrl = "$streamBase$embedPath"
                 val embedDoc = client.newCall(GET(embedUrl, streamHeaders)).execute().use { response ->
@@ -288,10 +294,11 @@ class ToonHub4u : AnimeHttpSource() {
     }
 
     /**
-     * The gdmirrorbot link redirects to a file page whose player is backed by
-     * an API (`/embedhelper2.php`) that lists several mirror embeds (Filemoon,
-     * streamhg, krakenfiles, earnvids, streamp2p). Resolve the first few into
-     * playable media URLs; JS-only mirrors are skipped silently.
+     * The gdmirrorbot link redirects to a file page. The current page renders
+     * its mirrors through client-side JS (tokenized `vpage` links behind
+     * Cloudflare), so the old embedhelper API is gone. Best effort: scan the
+     * page (and one iframe hop) for any directly-embedded media URL; silently
+     * skip JS-only mirrors.
      */
     private fun resolveMirrorPage(mirrorLink: String, videos: MutableList<Video>) {
         runCatching {
@@ -299,37 +306,8 @@ class ToonHub4u : AnimeHttpSource() {
                 resp.request.url.toString()
             }
             val pageHtml = client.newCall(GET(pageUrl, headers)).execute().use { it.body.string() }
-            val sid = Regex("""(?:videoId|gdmrfid)\s*=\s*"([^"]+)"""").find(pageHtml)?.groupValues?.get(1)
-                ?: pageUrl.substringAfterLast("/").substringBefore("?")
-            val apiUrl = Regex("""(https?://[^/"]+)""").find(pageHtml)?.groupValues?.get(1)?.let {
-                "$it/embedhelper2.php"
-            } ?: "${pageUrl.substringBeforeLast("/")}/embedhelper2.php"
-
-            val apiBody = client.newCall(
-                Request.Builder()
-                    .url(apiUrl)
-                    .post(FormBody.Builder().add("sid", sid).build())
-                    .headers(headers.newBuilder().set("Referer", pageUrl).build())
-                    .build(),
-            ).execute().use { it.body.string() }
-            val json = JSONObject(apiBody)
-            val sources = json.optJSONObject("sources") ?: return@runCatching
-            val ids = runCatching {
-                JSONObject(String(Base64.decode(json.optString("mresult"), Base64.DEFAULT), Charsets.UTF_8))
-            }.getOrNull() ?: return@runCatching
-
-            val keys = sources.keys().asSequence().toList()
-            keys.take(3).forEach { key ->
-                runCatching {
-                    val src = sources.getJSONObject(key)
-                    val siteUrl = src.optString("siteUrl").trim().trimEnd('/') + "/"
-                    val fileId = ids.optString(key)
-                    if (siteUrl == "/" || fileId.isBlank()) return@runCatching
-                    val friendly = src.optString("friendlyName").ifBlank { key }
-                    val streamUrl = extractStreamFromEmbed("$siteUrl$fileId", pageUrl) ?: return@runCatching
-                    videos += Video(streamUrl, friendly, streamUrl, headers = headers)
-                }
-            }
+            val direct = extractStreamFromEmbed(pageUrl, pageUrl) ?: return@runCatching
+            videos += Video(direct, "Mirror", direct, headers = headers)
         }
     }
 
@@ -350,7 +328,7 @@ class ToonHub4u : AnimeHttpSource() {
                 val firstUrl = resp.request.url.toString()
                 val firstBody = resp.body.string()
                 mediaFrom(firstUrl, firstBody) ?: run {
-                    val frame = Regex("""<iframe[^>]*src="([^"]+)""", RegexOption.IGNORE_CASE)
+                    val frame = Regex("""<iframe[^>]*src="([^"]+)"""", RegexOption.IGNORE_CASE)
                         .find(firstBody)?.groupValues?.get(1) ?: return@runCatching null
                     val next = if (frame.startsWith("http")) frame else "${embedUrl.substringBeforeLast("/")}/$frame"
                     client.newCall(GET(next, h)).execute().use { r2 ->
@@ -447,23 +425,67 @@ class ToonHub4u : AnimeHttpSource() {
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(GenreFilter())
 
+    // The site's real genre taxonomy from /category/gener/, plus the top-level
+    // content categories. Slugs map directly to category URLs.
     private class GenreFilter : AnimeFilter.Select<String>(
         "Category",
         arrayOf(
             "All",
+            // Top-level content types
             "Anime Series",
             "Anime Movies",
             "Animated Series",
             "Animation Movies",
             "Channel List",
+            // Genres (site taxonomy)
+            "18+",
+            "Action",
+            "Advanture",
+            "Big Magic",
+            "Comedy",
+            "Drama",
+            "Ecchi",
+            "Family",
+            "Fantasy",
+            "Harem",
+            "Hentai",
+            "Horror",
+            "Magical Animated",
+            "Martial Arts",
+            "Mystery",
+            "Romance",
+            "Sci-Fic",
+            "Shounen",
+            "Supernatural",
+            "Thriller",
         ),
     ) {
-        fun toSlug() = when (state) {
+        fun toPath() = when (state) {
             1 -> "anime/anime-series"
             2 -> "anime/anime-movies"
             3 -> "animated/animated-series"
             4 -> "animated/animation-movies"
             5 -> "channel-list"
+            6 -> "gener/18"
+            7 -> "gener/action"
+            8 -> "gener/advanture"
+            9 -> "gener/big-magic"
+            10 -> "gener/comedy"
+            11 -> "gener/drama-gener"
+            12 -> "gener/ecchi"
+            13 -> "gener/family"
+            14 -> "gener/fantasy"
+            15 -> "gener/harem"
+            16 -> "gener/hentai"
+            17 -> "gener/horror"
+            18 -> "gener/magical-animated"
+            19 -> "gener/martial-arts"
+            20 -> "gener/mystery"
+            21 -> "gener/romance"
+            22 -> "gener/sci-fic"
+            23 -> "gener/shounen"
+            24 -> "gener/supernatural"
+            25 -> "gener/thriller"
             else -> ""
         }
     }
