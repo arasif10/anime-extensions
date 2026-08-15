@@ -105,7 +105,9 @@ class ToonHub4u : AnimeHttpSource() {
      */
     private fun proxyImage(url: String?): String? {
         if (url == null || !url.contains("i.ibb.co")) return url
-        return "https://wsrv.nl/?url=" + URLEncoder.encode(url, "UTF-8")
+        // w=400 shrinks the download (~6x smaller) while keeping aspect ratio;
+        // the app still center-crops to its card ratio.
+        return "https://wsrv.nl/?url=" + URLEncoder.encode(url, "UTF-8") + "&w=400"
     }
 
     // ============================== Details ==============================
@@ -123,9 +125,14 @@ class ToonHub4u : AnimeHttpSource() {
         val document = Jsoup.parse(response.body.string())
         return SAnime.create().apply {
             title = cleanTitle(document.selectFirst("h1.entry-title")?.text().orEmpty())
-            val rawThumb = document.selectFirst("meta[property=og:image]")?.attr("content")
-                ?: document.selectFirst("div.entry-content img")?.attr("src")
-                ?: document.selectFirst("div.entry-content img")?.attr("data-src")
+            // The first entry-content image is the site's real poster: a portrait
+            // TMDB image (e.g. 296x444). Prefer it over the landscape og:image so
+            // the details cover matches the site and isn't cropped by the app.
+            val poster = document.selectFirst("div.entry-content img")
+            val rawThumb = poster?.attr("src")?.takeIf { it.isNotBlank() }
+                ?: poster?.attr("data-src")
+                ?: poster?.attr("data-lazy-src")
+                ?: document.selectFirst("meta[property=og:image]")?.attr("content")
             thumbnail_url = proxyImage(rawThumb)
             // The entry-content also contains every episode's download blocks;
             // keep only the real info: the metadata paragraph and the synopsis.
