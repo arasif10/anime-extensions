@@ -29,7 +29,12 @@ class ToonWorld4All : AnimeHttpSource() {
 
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-        .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        // No text/html preference: imgur 302-redirects i.imgur.com image URLs
+        // to its HTML gallery page when the request prefers HTML, which breaks
+        // every imgur thumbnail in the app (grid, search and related cards).
+        // The site itself serves HTML regardless of Accept, and image hosts
+        // serve images fine, so image-first Accept is safe for every request.
+        .add("Accept", "image/avif,image/webp,*/*;q=0.8")
         .add("Accept-Language", "en-US,en;q=0.9")
         .add("Referer", "$baseUrl/")
 
@@ -101,10 +106,19 @@ class ToonWorld4All : AnimeHttpSource() {
         val document = Jsoup.parse(response.body.string())
         return SAnime.create().apply {
             title = document.selectFirst("h1.entry-title")?.text().orEmpty()
-            // Prefer the og:image: the first img.wp-post-image on the details
-            // page is usually an in-article screenshot, so using it made the
-            // tile's poster change every time an entry was re-opened.
-            thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("content")
+            // The first content image is the site's real poster: a portrait
+            // image (e.g. 404x606). Prefer a portrait one over the landscape
+            // og:image so the details cover matches the site and isn't cropped.
+            val poster = document.select("div.herald-entry-content img, div.entry-content img")
+                .firstOrNull { img ->
+                    val w = img.attr("width").toIntOrNull()
+                    val h = img.attr("height").toIntOrNull()
+                    w != null && h != null && w < h
+                } ?: document.selectFirst("div.herald-entry-content img, div.entry-content img")
+            thumbnail_url = poster?.attr("src")?.takeIf { it.isNotBlank() }
+                ?: poster?.attr("data-src")
+                ?: poster?.attr("data-lazy-src")
+                ?: document.selectFirst("meta[property=og:image]")?.attr("content")
                 ?: document.selectFirst("img.wp-post-image")?.attr("src")
             description = document.select("div.herald-entry-content p").joinToString("\n\n") { it.text() }
                 .ifBlank { document.select("div.entry-content p").joinToString("\n\n") { it.text() } }
