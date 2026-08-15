@@ -16,6 +16,7 @@ import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.Jsoup
 import rx.Observable
+import java.net.URLEncoder
 
 class ToonHub4u : AnimeHttpSource() {
 
@@ -83,13 +84,28 @@ class ToonHub4u : AnimeHttpSource() {
                 this.title = cleanTitle(title)
                 this.url = url
                 // FIFU lazy-loads some images; fall back to data-src when src is empty.
-                thumbnail_url = img?.attr("src")?.takeIf { it.isNotBlank() }
+                val rawThumb = img?.attr("src")?.takeIf { it.isNotBlank() }
                     ?: img?.attr("data-src")
                     ?: img?.attr("data-lazy-src")
+                // i.ibb.co is SNI-blocked on some networks (the app's OkHttp can't
+                // reach it, though browsers can via QUIC). Route those thumbnails
+                // through the wsrv.nl image proxy, which is reachable everywhere.
+                thumbnail_url = proxyImage(rawThumb)
             }
         }
         val hasNextPage = document.select("li.the-next-page").isNotEmpty()
         return AnimesPage(animeList, hasNextPage)
+    }
+
+    /**
+     * i.ibb.co is SNI-blocked on some networks: the app's OkHttp TLS handshake
+     * hangs (browsers work around it via QUIC/ECH), so posters never load.
+     * wsrv.nl fetches the image server-side and is reachable everywhere, so
+     * rewrite i.ibb.co thumbnails through it. Other hosts pass through.
+     */
+    private fun proxyImage(url: String?): String? {
+        if (url == null || !url.contains("i.ibb.co")) return url
+        return "https://wsrv.nl/?url=" + URLEncoder.encode(url, "UTF-8")
     }
 
     // ============================== Details ==============================
@@ -107,9 +123,10 @@ class ToonHub4u : AnimeHttpSource() {
         val document = Jsoup.parse(response.body.string())
         return SAnime.create().apply {
             title = cleanTitle(document.selectFirst("h1.entry-title")?.text().orEmpty())
-            thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("content")
+            val rawThumb = document.selectFirst("meta[property=og:image]")?.attr("content")
                 ?: document.selectFirst("div.entry-content img")?.attr("src")
                 ?: document.selectFirst("div.entry-content img")?.attr("data-src")
+            thumbnail_url = proxyImage(rawThumb)
             // The entry-content also contains every episode's download blocks;
             // keep only the real info: the metadata paragraph and the synopsis.
             val meta = document.select("div.entry-content p").firstOrNull {

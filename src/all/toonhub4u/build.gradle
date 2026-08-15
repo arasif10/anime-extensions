@@ -2,7 +2,7 @@ ext {
     extName = 'ToonHub4u'
     extLabel = 'ToonHub4u (𝕬𝕽)'
     extClass = '.ToonHub4u'
-    extVersionCode = 12
+    extVersionCode = 13
     isNsfw = false
 }
 
