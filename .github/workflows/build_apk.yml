@@ -56,9 +56,9 @@ jobs:
           path: '**/build/outputs/apk/**/*.apk'
 
   publish:
-    # Publish the freshly built APKs to the public arasif10/extensions repo so
+    # Publish the freshly built APKs to the public arasif10/anime-extensions repo so
     # AniZen users can update. Needs EXTENSIONS_REPO_TOKEN (a PAT with write
-    # access to arasif10/extensions) stored in this repo's secrets. Steps are
+    # access to arasif10/anime-extensions) stored in this repo's secrets. Steps are
     # gated on it so the job no-ops (skipped) until the secret is configured -
     # job-level "if" cannot reference secrets, so it is exposed via env instead.
     needs: build
@@ -80,7 +80,7 @@ jobs:
         if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
         run: |
           git clone --quiet --branch repo \
-            "https://x-access-token:${EXTENSIONS_REPO_TOKEN}@github.com/arasif10/extensions.git" \
+            "https://x-access-token:${EXTENSIONS_REPO_TOKEN}@github.com/arasif10/anime-extensions.git" \
             extensions-repo
 
       - name: Collect extension icons

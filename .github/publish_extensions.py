@@ -73,7 +73,7 @@ def update_entry(entry, suffix, apk_name, version, code):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--apk-dir", required=True, help="directory containing the built APKs (recursively)")
-    parser.add_argument("--extensions-repo", required=True, help="checked-out clone of arasif10/extensions")
+    parser.add_argument("--extensions-repo", required=True, help="checked-out clone of arasif10/anime-extensions")
     parser.add_argument("--icons-dir", default=None, help="optional dir with <suffix>.png icons, synced to icon/<pkg>.png")
     parser.add_argument("--dry-run", action="store_true", help="update files locally but do not commit or push")
     args = parser.parse_args()
