@@ -164,49 +164,64 @@ class ToonStream : AnimeHttpSource() {
 
     override fun episodeListParse(response: Response): List<SEpisode> {
         val document = Jsoup.parse(response.body.string(), baseUrl)
-        val episodes = LinkedHashMap<Float, SEpisode>()
+
+        // Collect every episode as plain data first so we know the total
+        // season count before deciding how to name/number them.
+        data class EpisodeInfo(val season: Int, val num: Int, val url: String)
+        val all = mutableListOf<EpisodeInfo>()
+
+        fun parseItems(items: List<Element>) {
+            items.forEach { item ->
+                val link = item.selectFirst("a.lnk-blk") ?: return@forEach
+                val url = link.attr("abs:href")
+                if (url.isBlank()) return@forEach
+                val match = EPISODE_URL_REGEX.find(url) ?: return@forEach
+                val season = match.groupValues[2].toIntOrNull() ?: 1
+                val num = match.groupValues[3].toIntOrNull() ?: return@forEach
+                all.add(EpisodeInfo(season, num, url))
+            }
+        }
 
         // The initial season shown on the series page (normally Season 1).
-        val activeSeason = document.selectFirst(".section.episodes .season-btn.active")
-            ?.attr("data-season")?.toIntOrNull() ?: 1
-
-        document.select("#episode_by_temp li").forEach { item ->
-            parseEpisodeItem(item, activeSeason)?.let { episodes[it.episode_number] = it }
-        }
+        parseItems(document.select("#episode_by_temp li").toList())
 
         // Other seasons are lazy-loaded via /series/<slug>/season/<n> (AJAX) and
         // each returns a bare <li> fragment. Fetch them one by one and merge.
         document.select(".section.episodes .season-btn[data-url]").forEach { btn ->
-            val season = btn.attr("data-season").toIntOrNull() ?: return@forEach
-            if (season == activeSeason) return@forEach
             val seasonUrl = btn.attr("data-url").ifBlank { return@forEach }
             runCatching {
                 val seasonDoc = client.newCall(
                     GET("$baseUrl$seasonUrl", headersBuilder().add("X-Requested-With", "XMLHttpRequest").build()),
                 ).execute().use { Jsoup.parse(it.body.string(), baseUrl) }
-                seasonDoc.select("li").forEach { item ->
-                    parseEpisodeItem(item, season)?.let { episodes[it.episode_number] = it }
-                }
+                parseItems(seasonDoc.select("li").toList())
             }
         }
 
-        // Newest episode first.
-        return episodes.values.sortedByDescending { it.episode_number }
-    }
+        // Multi-season shows use "Season X - Episode Y" names - AniZen parses
+        // that pattern and renders the season switcher buttons in the episode
+        // list (same convention as the MovieBox extension).
+        val multiSeason = (all.maxOfOrNull { it.season } ?: 1) > 1
 
-    private fun parseEpisodeItem(item: Element, season: Int): SEpisode? {
-        val link = item.selectFirst("a.lnk-blk") ?: return null
-        val url = link.attr("abs:href")
-        if (url.isBlank()) return null
-        val match = EPISODE_URL_REGEX.find(url) ?: return null
-        val epNum = match.groupValues[3].toIntOrNull() ?: return null
-        return SEpisode.create().apply {
-            this.url = url
-            name = "Episode $epNum"
-            // Encode the season so episodes from different seasons sort in order.
-            episode_number = (season * 1000 + epNum).toFloat()
-            date_upload = System.currentTimeMillis()
-        }
+        // Newest episode first: latest season on top, highest episode within it.
+        return all
+            .sortedWith(compareByDescending<EpisodeInfo> { it.season }.thenByDescending { it.num })
+            .map { info ->
+                SEpisode.create().apply {
+                    url = info.url
+                    name = if (multiSeason) {
+                        "Season ${info.season} - Episode ${info.num}"
+                    } else {
+                        "Episode ${info.num}"
+                    }
+                    // Keep numbers unique/sortable across seasons.
+                    episode_number = if (multiSeason) {
+                        (info.season * 1000 + info.num).toFloat()
+                    } else {
+                        info.num.toFloat()
+                    }
+                    date_upload = System.currentTimeMillis()
+                }
+            }
     }
 
     // ============================== Video Streams ==============================
