@@ -9,6 +9,9 @@ import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.runBlocking
 import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.Request
@@ -281,12 +284,66 @@ class ToonStream : AnimeHttpSource() {
                 Request.Builder().url("https://rubystm.com/dl").post(form).headers(rubyHeaders).build(),
             ).execute().use { it.body.string() }
 
-            val streamUrl = decodePackedStreamUrl(html) ?: return@runCatching
+            val masterUrl = decodePackedStreamUrl(html) ?: return@runCatching
             val captions = decodeCaptions(html).filter { it.second.endsWith(".vtt") }
             val tracks = captions.map { Track(it.second, it.first) }
-            videos += Video(streamUrl, "Ruby (HLS)", streamUrl, headers = rubyHeaders, subtitleTracks = tracks)
+            videos += buildHlsVideos(masterUrl, "Ruby", rubyHeaders, tracks)
         }
         return videos
+    }
+
+    /**
+     * Expands an HLS master playlist into one Video per quality variant
+     * (360p/480p/720p/1080p) so the app shows a real quality picker. Falls
+     * back to the master URL itself (adaptive/auto) when parsing fails.
+     */
+    private fun buildHlsVideos(
+        masterUrl: String,
+        serverName: String,
+        reqHeaders: Headers,
+        tracks: List<Track>,
+    ): List<Video> {
+        val videos = mutableListOf<Video>()
+        val playlist = runCatching {
+            client.newCall(GET(masterUrl, reqHeaders)).execute().use { response ->
+                if (!response.isSuccessful) null else response.body.string()
+            }
+        }.getOrNull()
+        val variants = playlist?.let(::parseHlsVariants).orEmpty()
+
+        if (variants.isNotEmpty()) {
+            variants.forEach { (label, url) ->
+                videos += Video(url, "$serverName • $label", url, headers = reqHeaders, subtitleTracks = tracks)
+            }
+        } else {
+            videos += Video(masterUrl, "$serverName (Auto)", masterUrl, headers = reqHeaders, subtitleTracks = tracks)
+        }
+        return videos
+    }
+
+    /**
+     * Parses #EXT-X-STREAM-INF entries of a master playlist into
+     * (quality label, variant url) pairs.
+     */
+    private fun parseHlsVariants(playlist: String): List<Pair<String, String>> {
+        val out = mutableListOf<Pair<String, String>>()
+        var pendingHeight: String? = null
+        playlist.lines().forEach { rawLine ->
+            val line = rawLine.trim()
+            when {
+                line.startsWith("#EXT-X-STREAM-INF") -> {
+                    pendingHeight = Regex("RESOLUTION=\\d+x(\\d+)").find(line)?.groupValues?.get(1)
+                }
+                line.isNotEmpty() && !line.startsWith("#") -> {
+                    val height = pendingHeight
+                    if (height != null && line.contains(".m3u8")) {
+                        out.add("${height}p" to line)
+                    }
+                    pendingHeight = null
+                }
+            }
+        }
+        return out.distinctBy { it.first }
     }
 
     override fun videoListRequest(episode: SEpisode): Request = GET(episode.url, headers)
@@ -294,24 +351,32 @@ class ToonStream : AnimeHttpSource() {
     override fun videoListParse(response: Response): List<Video> {
         val document = Jsoup.parse(response.body.string(), baseUrl)
         val episodeUrl = response.request.url.toString()
-        val videos = mutableListOf<Video>()
 
-        document.select(".video-player .video iframe").forEach { frame ->
+        val tokens = document.select(".video-player .video iframe").mapNotNull { frame ->
             val src = frame.attr("src").ifBlank { frame.attr("data-src") }
             val token = src.substringAfter("/embed/", "").substringBefore("?")
-            if (token.isEmpty() || token.startsWith("http")) return@forEach
-
-            runCatching {
-                videos += resolveEmbedServer(token, episodeUrl)
-            }
+            token.takeIf { it.isNotEmpty() && !it.startsWith("http") }
         }
 
-        // Prefer real streams, then 1080p, then 720p, then the rest.
-        return videos.distinctBy { it.videoUrl }.sortedWith(
-            compareByDescending<Video> { it.quality.contains("1080") }
-                .thenByDescending { it.quality.contains("720") }
-                .thenByDescending { !it.quality.contains("YouTube") },
-        )
+        // Resolve every server in parallel. Sequential resolution meant 8+
+        // network round trips before anything showed up - opening an episode
+        // took forever compared to the site's own player.
+        val perServer: List<List<Video>> = runBlocking {
+            tokens.map { token ->
+                async {
+                    runCatching { resolveEmbedServer(token, episodeUrl) }.getOrDefault(emptyList())
+                }
+            }.awaitAll()
+        }
+
+        // Best quality first so the default pick is the sharpest stream.
+        return perServer.flatten()
+            .distinctBy { it.videoUrl }
+            .sortedWith(
+                compareByDescending<Video> { it.quality.contains("1080") }
+                    .thenByDescending { it.quality.contains("720") }
+                    .thenByDescending { it.quality.contains("480") },
+            )
     }
     private fun tryGet(url: String, referer: String): String? {
         return runCatching {
@@ -413,16 +478,10 @@ class ToonStream : AnimeHttpSource() {
                 }
                 // The player page packs its JWPlayer config with a Dean Edwards
                 // packer (eval(function(p,a,c,k,e,d))) containing HLS URLs.
-                val streamUrl = decodePackedStreamUrl(playerHtml) ?: return@runCatching
+                val masterUrl = decodePackedStreamUrl(playerHtml) ?: return@runCatching
                 val captions = decodeCaptions(playerHtml).filter { it.second.endsWith(".vtt") }
                 val tracks = captions.map { Track(it.second, it.first) }
-                videos += Video(
-                    streamUrl,
-                    "$friendlyName (HLS)",
-                    streamUrl,
-                    headers = sourceHeaders,
-                    subtitleTracks = tracks,
-                )
+                videos += buildHlsVideos(masterUrl, friendlyName, sourceHeaders, tracks)
             }
         }
         return videos
