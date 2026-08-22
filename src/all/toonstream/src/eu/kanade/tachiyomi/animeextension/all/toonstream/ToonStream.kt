@@ -57,7 +57,7 @@ class ToonStream : AnimeHttpSource() {
 
     override fun latestUpdatesParse(response: Response): AnimesPage {
         if (!response.request.url.encodedPath.endsWith("/home")) return parsePostList(response)
-        val document = Jsoup.parse(response.body.string())
+        val document = Jsoup.parse(response.body.string(), baseUrl)
         val items = document.select("article.post").mapNotNull { article ->
             val link = article.selectFirst("a.lnk-blk[href*='/episode/']") ?: return@mapNotNull null
             val episodeUrl = link.attr("abs:href")
@@ -100,10 +100,12 @@ class ToonStream : AnimeHttpSource() {
     override fun searchAnimeParse(response: Response): AnimesPage = parsePostList(response)
 
     private fun parsePostList(response: Response): AnimesPage {
-        val document = Jsoup.parse(response.body.string())
+        val document = Jsoup.parse(response.body.string(), baseUrl)
         val animeList = document.select("ul.post-lst li article.post").mapNotNull { article ->
             val link = article.selectFirst("a.lnk-blk") ?: return@mapNotNull null
-            val url = link.attr("href")
+            // abs:href resolves against baseUrl; the site's hrefs are relative
+            // (/series/...) and OkHttp rejects relative request URLs.
+            val url = link.attr("abs:href")
             if (url.isBlank()) return@mapNotNull null
             val img = article.selectFirst("img")
             SAnime.create().apply {
@@ -137,7 +139,7 @@ class ToonStream : AnimeHttpSource() {
     override fun animeDetailsRequest(anime: SAnime): Request = GET(anime.url, headers)
 
     override fun animeDetailsParse(response: Response): SAnime {
-        val document = Jsoup.parse(response.body.string())
+        val document = Jsoup.parse(response.body.string(), baseUrl)
         return SAnime.create().apply {
             title = document.selectFirst("h1.entry-title")?.text()?.trim().orEmpty()
             // The first detail-page thumbnail is the portrait TMDB poster.
@@ -157,7 +159,7 @@ class ToonStream : AnimeHttpSource() {
     override fun episodeListRequest(anime: SAnime): Request = GET(anime.url, headers)
 
     override fun episodeListParse(response: Response): List<SEpisode> {
-        val document = Jsoup.parse(response.body.string())
+        val document = Jsoup.parse(response.body.string(), baseUrl)
         val episodes = LinkedHashMap<Float, SEpisode>()
 
         // The initial season shown on the series page (normally Season 1).
@@ -177,7 +179,7 @@ class ToonStream : AnimeHttpSource() {
             runCatching {
                 val seasonDoc = client.newCall(
                     GET("$baseUrl$seasonUrl", headersBuilder().add("X-Requested-With", "XMLHttpRequest").build()),
-                ).execute().use { Jsoup.parse(it.body.string()) }
+                ).execute().use { Jsoup.parse(it.body.string(), baseUrl) }
                 seasonDoc.select("li").forEach { item ->
                     parseEpisodeItem(item, season)?.let { episodes[it.episode_number] = it }
                 }
@@ -213,7 +215,7 @@ class ToonStream : AnimeHttpSource() {
     private fun resolveEmbedServer(token: String, episodeUrl: String): List<Video> {
         val embedPage = try {
             client.newCall(GET("$baseUrl/embed/$token", headers)).execute().use {
-                Jsoup.parse(it.body.string())
+                Jsoup.parse(it.body.string(), baseUrl)
             }
         } catch (e: Exception) {
             return emptyList()
@@ -271,7 +273,7 @@ class ToonStream : AnimeHttpSource() {
     override fun videoListRequest(episode: SEpisode): Request = GET(episode.url, headers)
 
     override fun videoListParse(response: Response): List<Video> {
-        val document = Jsoup.parse(response.body.string())
+        val document = Jsoup.parse(response.body.string(), baseUrl)
         val episodeUrl = response.request.url.toString()
         val videos = mutableListOf<Video>()
 
