@@ -232,8 +232,8 @@ class ToonHub4u : AnimeHttpSource() {
             .set("Referer", "$streamBase/")
             .build()
 
-        // Only the first iframe carries a plain `src`; the rest lazy-load
-        // through `data-src`, so read both. Skip the YouTube trailer embed.
+        // Step 1: Get embed paths from the episode page.
+        // The page uses data-src (lazy-loaded) iframes pointing to /embed/XXXX.
         val embeds = try {
             client.newCall(GET(episodePageUrl, streamHeaders)).execute().use { response ->
                 val doc = Jsoup.parse(response.body.string())
@@ -246,47 +246,112 @@ class ToonHub4u : AnimeHttpSource() {
             emptyList()
         }
 
-        embeds.take(6).forEachIndexed { index, embedPath ->
+        // Step 2: Each /embed/XXXX on toon-stream.site redirects to
+        // gdmirrorbot.nl/embed/XXXX which loads an iframe to the same.
+        // We POST to gdmirrorbot's embedhelper2.php API (which 302-redirects
+        // to pro.iqsmartgames.com/embedhelper2.php) to get a JSON with
+        // source names, their site URLs, and base64-encoded file codes.
+        embeds.take(4).forEach { embedPath ->
+            val embedId = embedPath.substringAfter("/embed/")
             runCatching {
-                val embedUrl = "$streamBase$embedPath"
-                val embedDoc = client.newCall(GET(embedUrl, streamHeaders)).execute().use { response ->
-                    Jsoup.parse(response.body.string())
-                }
-                val playerSrc = embedDoc.select("iframe[src]").attr("src")
-                if (playerSrc.isBlank() || !playerSrc.contains("/e/")) return@runCatching
-                val host = playerSrc.substringBefore("/e/")
-                val code = playerSrc.substringAfter("/e/").substringBefore(".html")
+                videos += resolveGdMirrorSources(embedId, streamHeaders)
+            }
+        }
+        return videos
+    }
 
-                val form = FormBody.Builder()
-                    .add("op", "embed")
-                    .add("file_code", code)
-                    .add("auto", "1")
-                    .add("referer", embedUrl)
-                    .build()
-                val playerHeaders = headers.newBuilder()
-                    .set("Referer", "$host/e/$code.html")
-                    .build()
-                val playerBody = client.newCall(
-                    Request.Builder().url("$host/dl").post(form).headers(playerHeaders).build(),
-                ).execute().use { it.body.string() }
+    /**
+     * Calls the gdmirrorbot.nl embedhelper2.php API to get the list of
+     * streaming sources (streamhg, filemoon, etc.), then resolves each
+     * source's player page to extract the actual HLS/MP4 URL.
+     */
+    private fun resolveGdMirrorSources(embedId: String, baseHeaders: Headers): List<Video> {
+        val videos = mutableListOf<Video>()
+        val apiHeaders = baseHeaders.newBuilder()
+            .set("Content-Type", "application/x-www-form-urlencoded")
+            .set("Origin", "https://gdmirrorbot.nl")
+            .set("Referer", "https://gdmirrorbot.nl/embed/$embedId")
+            .build()
 
-                val streamUrl = decodePackedStreamUrl(playerBody) ?: return@runCatching
-                val subtitles = mutableListOf<Track>()
-                decodeCaptions(playerBody).forEach { (label, url) ->
-                    if (url.endsWith(".vtt") && !url.contains("_sli.")) {
-                        subtitles.add(Track(url, label))
-                    }
+        val form = FormBody.Builder()
+            .add("sid", embedId)
+            .add("UserFavSite", "")
+            .add("currentDomain", "[\"toon-stream.site\",\"gdmirrorbot.nl\"]")
+            .build()
+
+        val apiResponse = try {
+            client.newCall(
+                Request.Builder()
+                    .url("https://gdmirrorbot.nl/embedhelper2.php")
+                    .post(form)
+                    .headers(apiHeaders)
+                    .build(),
+            ).execute().use { it.body.string() }
+        } catch (e: Exception) {
+            return emptyList()
+        }
+
+        // Parse the JSON response to get source names, site URLs, and file codes.
+        val sourcesRegex = Regex(""""(\w+)":\{[^}]*?"siteUrl"\s*:\s*"([^"]+)"[^}]*?"""")
+        val mresultMatch = Regex(""""mresult"\s*:\s*"([^"]+)"""").find(apiResponse)
+        val fileCodes = mutableMapOf<String, String>()
+        if (mresultMatch != null) {
+            val decoded = try {
+                android.util.Base64.decode(mresultMatch.groupValues[1], android.util.Base64.DEFAULT)
+                    .toString(Charsets.UTF_8)
+            } catch (e: Exception) { "" }
+            // mresult is like {"smwh":"elc6m7opk5v7","flmn":"s7k6o0e3b5k2"}
+            Regex(""""(\w+)"\s*:\s*"([^"]+)"""").findAll(decoded).forEach { m ->
+                fileCodes[m.groupValues[1]] = m.groupValues[2]
+            }
+        }
+
+        for (match in sourcesRegex.findAll(apiResponse)) {
+            val sourceKey = match.groupValues[1]
+            val siteUrl = match.groupValues[2]
+            val fileCode = fileCodes[sourceKey] ?: continue
+            val friendlyName = getFriendlyName(sourceKey)
+            runCatching {
+                val sourceHeaders = baseHeaders.newBuilder()
+                    .set("Referer", "https://gdmirrorbot.nl/embed/$embedId")
+                    .build()
+                val playerUrl = "$siteUrl$fileCode"
+                val playerHtml = client.newCall(GET(playerUrl, sourceHeaders)).execute().use {
+                    it.body.string()
                 }
+                // The player page uses a Dean Edwards packer (eval(function(p,a,c,k,e,d)))
+                // containing JWPlayer config with HLS m3u8 URLs.
+                val streamUrl = decodePackedStreamUrl(playerHtml) ?: return@runCatching
+                val subtitles = decodeCaptions(playerHtml).filter { it.second.endsWith(".vtt") }
+                val tracks = subtitles.map { Track(it.second, it.first) }
                 videos += Video(
                     streamUrl,
-                    "Server ${index + 1} (HLS)",
+                    "$friendlyName (HLS)",
                     streamUrl,
-                    headers = streamHeaders,
-                    subtitleTracks = subtitles,
+                    headers = sourceHeaders,
+                    subtitleTracks = tracks,
                 )
             }
         }
         return videos
+    }
+
+    private fun getFriendlyName(key: String): String = when (key) {
+        "smwh" -> "StreamHG"
+        "flmn" -> "Filemoon"
+        "flls" -> "FileLions"
+        "ddstm" -> "DropLoad"
+        "plrx" -> "PlayerX"
+        "abys" -> "Abyss"
+        "strmtp" -> "StreamTape"
+        "onud" -> "UpnShare"
+        "vdgd" -> "VDGD"
+        "vosx" -> "Voe"
+        "rpmshre" -> "RPMShare"
+        "kknfl" -> "KrakenFiles"
+        "upnshr" -> "UpnShare"
+        "strmp2" -> "StreamP2P"
+        else -> key.uppercase()
     }
 
     private fun resolveMirrorStreams(postUrl: String, epNum: String): List<Video> {
@@ -321,57 +386,32 @@ class ToonHub4u : AnimeHttpSource() {
     }
 
     /**
-     * The gdmirrorbot link redirects to a file page. The current page renders
-     * its mirrors through client-side JS (tokenized `vpage` links behind
-     * Cloudflare), so the old embedhelper API is gone. Best effort: scan the
-     * page (and one iframe hop) for any directly-embedded media URL; silently
-     * skip JS-only mirrors.
+     * The gdmirrorbot download links on the toonhub4u.co post page now route
+     * through the same embedhelper2.php API as the ToonStream embeds. We
+     * extract the embed ID from the gdmirrorbot URL and resolve it the same
+     * way as resolveGdMirrorSources.
      */
     private fun resolveMirrorPage(mirrorLink: String, videos: MutableList<Video>) {
         runCatching {
-            val pageUrl = client.newCall(GET(mirrorLink, headers)).execute().use { resp ->
-                resp.request.url.toString()
-            }
-            val pageHtml = client.newCall(GET(pageUrl, headers)).execute().use { it.body.string() }
-            val direct = extractStreamFromEmbed(pageUrl, pageUrl) ?: return@runCatching
-            videos += Video(direct, "Mirror", direct, headers = headers)
+            // gdmirrorbot URLs look like https://gdmirrorbot.nl/embed/vk6h2nh
+            // or just have the ID in the path.
+            val embedId = mirrorLink.substringAfterLast("/").substringBefore("?")
+            if (embedId.isBlank()) return@runCatching
+            videos += resolveGdMirrorSources(embedId, headers)
         }
     }
 
     /**
-     * Follows an embed page (redirects plus one iframe hop) and returns the
-     * first playable media URL found, or null for JS-only players.
-     */
-    private fun extractStreamFromEmbed(embedUrl: String, referer: String): String? {
-        val h = headers.newBuilder().set("Referer", referer).build()
-        val mediaInBody = Regex("""https?://[^"'\s<>]*(?:\.m3u8|\.mp4|\.mkv)(?:[?&][^"'\s<>]*)?""", RegexOption.IGNORE_CASE)
-        val mediaExt = Regex("""\.(?:m3u8|mp4|mkv)(?:\?|$)""", RegexOption.IGNORE_CASE)
-        fun mediaFrom(url: String, body: String): String? {
-            mediaInBody.find(body)?.let { return it.value }
-            return if (mediaExt.containsMatchIn(url)) url else null
-        }
-        return runCatching {
-            client.newCall(GET(embedUrl, h)).execute().use { resp ->
-                val firstUrl = resp.request.url.toString()
-                val firstBody = resp.body.string()
-                mediaFrom(firstUrl, firstBody) ?: run {
-                    val frame = Regex("""<iframe[^>]*src="([^"]+)"""", RegexOption.IGNORE_CASE)
-                        .find(firstBody)?.groupValues?.get(1) ?: return@runCatching null
-                    val next = if (frame.startsWith("http")) frame else "${embedUrl.substringBeforeLast("/")}/$frame"
-                    client.newCall(GET(next, h)).execute().use { r2 ->
-                        val secondUrl = r2.request.url.toString()
-                        val secondBody = r2.body.string()
-                        mediaFrom(secondUrl, secondBody)
-                    }
-                }
-            }
-        }.getOrNull()
-    }
-
-    /**
-     * The ToonStream player (a streamruby/fileruby clone) packs its player
-     * config with a modified Dean Edwards packer whose placeholders are
-     * base-36 encoded. Decode the eval block and pull the HLS `file` URL out.
+     * The stream source page (streamhg, filemoon, etc.) packs its JWPlayer
+     * config with a standard Dean Edwards packer. Decode the eval block and
+     * pull the HLS m3u8 URL out of the JWPlayer `links` or `sources` config.
+     *
+     * The decoded JS typically looks like:
+     *   var links={"hls2":"https://...master.m3u8?t=...","hls3":"..."};
+     *   jwplayer("vplayer").setup({sources:[{file:links.hls4||links.hls3||links.hls2,type:"hls"}],...});
+     *
+     * We extract the first m3u8 URL from the links object (preferring hls2,
+     * the primary CDN). We also try the `file:` pattern for other packers.
      */
     private fun decodePackedStreamUrl(html: String): String? {
         var searchFrom = 0
@@ -379,25 +419,50 @@ class ToonHub4u : AnimeHttpSource() {
             val start = html.indexOf("eval(function(p,a,c,k,e,d)", searchFrom)
             if (start == -1) return null
             val segment = html.substring(start)
-            val args = Regex("""}\('(.*)',\s*\d+,\s*(\d+),\s*'(.*)'\.split\('\|'\)""", RegexOption.DOT_MATCHES_ALL)
+            val args = Regex("""}\('(.*)',\s*(\d+),\s*(\d+),\s*'(.*)'\.split\('\|'\)""", RegexOption.DOT_MATCHES_ALL)
                 .find(segment) ?: return null
             val src = args.groupValues[1]
-            val count = args.groupValues[2].toIntOrNull() ?: 0
-            val dict = args.groupValues[3].split("|")
+            val radix = args.groupValues[2].toIntOrNull() ?: 10
+            val count = args.groupValues[3].toIntOrNull() ?: 0
+            val dict = args.groupValues[4].split("|")
             var decoded = src
             for (i in count - 1 downTo 0) {
                 if (i < dict.size && dict[i].isNotEmpty()) {
-                    decoded = decoded.replace(Regex("\\b" + toBase36(i) + "\\b"), dict[i])
+                    decoded = decoded.replace(Regex("\\b" + toBase(i, radix) + "\\b"), dict[i])
                 }
             }
-            // The player config keys may be quoted or not ("file": or file:),
-            // depending on how the site packs it, so accept both.
+            // Pattern 1: JWPlayer links JSON (streamhg style)
+            //   "hls2":"https://...master.m3u8?t=..."
+            for (key in listOf("hls2", "hls3", "hls4", "hls")) {
+                val linkMatch = Regex(""""$key"\s*:\s*"(https?://[^"]+)"""").find(decoded)
+                if (linkMatch != null && (linkMatch.groupValues[1].contains("m3u8") || linkMatch.groupValues[1].contains("mp4"))) {
+                    return linkMatch.groupValues[1]
+                }
+            }
+            // Pattern 2: file: "https://...m3u8" (generic JWPlayer config)
             val fileMatch = Regex("""["']?file["']?\s*:\s*"([^"]*(?:m3u8|\.mp4)[^"]*)"""").find(decoded)
             if (fileMatch != null) {
                 return fileMatch.groupValues[1]
             }
+            // Pattern 3: sources:[{file:"https://...m3u8"}]
+            val sourcesMatch = Regex("""sources\s*:\s*\[\s*\{[^}]*?file\s*:\s*"([^"]+)"""").find(decoded)
+            if (sourcesMatch != null) {
+                return sourcesMatch.groupValues[1]
+            }
             searchFrom = start + 10
         }
+    }
+
+    private fun toBase(n: Int, radix: Int): String {
+        val digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+        if (n == 0) return "0"
+        var num = n
+        var out = ""
+        while (num > 0) {
+            out = digits[num % radix] + out
+            num /= radix
+        }
+        return out
     }
 
     private fun decodeCaptions(html: String): List<Pair<String, String>> {
@@ -408,36 +473,25 @@ class ToonHub4u : AnimeHttpSource() {
                 val start = html.indexOf("eval(function(p,a,c,k,e,d)", searchFrom)
                 if (start == -1) break
                 val segment = html.substring(start)
-                val args = Regex("""}\('(.*)',\s*\d+,\s*(\d+),\s*'(.*)'\.split\('\|'\)""", RegexOption.DOT_MATCHES_ALL)
+                val args = Regex("""}\('(.*)',\s*(\d+),\s*(\d+),\s*'(.*)'\.split\('\|'\)""", RegexOption.DOT_MATCHES_ALL)
                     .find(segment) ?: break
                 val src = args.groupValues[1]
-                val count = args.groupValues[2].toIntOrNull() ?: 0
-                val dict = args.groupValues[3].split("|")
+                val radix = args.groupValues[2].toIntOrNull() ?: 10
+                val count = args.groupValues[3].toIntOrNull() ?: 0
+                val dict = args.groupValues[4].split("|")
                 var decoded = src
                 for (i in count - 1 downTo 0) {
                     if (i < dict.size && dict[i].isNotEmpty()) {
-                        decoded = decoded.replace(Regex("\\b" + toBase36(i) + "\\b"), dict[i])
+                        decoded = decoded.replace(Regex("\\b" + toBase(i, radix) + "\\b"), dict[i])
                     }
                 }
-                val tracks = Regex("""["']?file["']?\s*:\s*"([^"]+\.vtt)"[^}]*?["']?label["']?\s*:\s*"([^"]*)"""", RegexOption.DOT_MATCHES_ALL)
-                    .findAll(decoded)
+                // JWPlayer tracks: {file:"...vtt",label:"English",kind:"captions"}
+                val tracks = Regex("""file\s*:\s*"([^"]+\.vtt)"[^}]*?label\s*:\s*"([^"]*)"""").findAll(decoded)
                 tracks.forEach { m ->
                     out.add(Pair(m.groupValues[2], m.groupValues[1]))
                 }
                 searchFrom = start + 10
             }
-        }
-        return out
-    }
-
-    private fun toBase36(n: Int): String {
-        val digits = "0123456789abcdefghijklmnopqrstuvwxyz"
-        if (n == 0) return "0"
-        var num = n
-        var out = ""
-        while (num > 0) {
-            out = digits[num % 36] + out
-            num /= 36
         }
         return out
     }
