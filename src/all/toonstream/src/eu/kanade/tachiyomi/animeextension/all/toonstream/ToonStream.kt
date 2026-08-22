@@ -1,5 +1,11 @@
 package eu.kanade.tachiyomi.animeextension.all.toonstream
 
+import android.app.Application
+import android.content.SharedPreferences
+import android.net.Uri
+import androidx.preference.EditTextPreference
+import androidx.preference.PreferenceScreen
+import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
@@ -22,8 +28,13 @@ import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import rx.Observable
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 
-class ToonStream : AnimeHttpSource() {
+class ToonStream : ConfigurableAnimeSource, AnimeHttpSource() {
 
     override val name = "ToonStream (𝕬𝕽)"
 
@@ -36,6 +47,22 @@ class ToonStream : AnimeHttpSource() {
     // Fixed source id (generateId("toonstream", "all", 1)) so the app maps the
     // index entry to the installed extension across version bumps.
     override val id: Long = 4164599757938560453L
+
+    private val preferences: SharedPreferences by lazy {
+        Injekt.get<Application>().getSharedPreferences("source_$id", 0)
+    }
+
+    override fun getSourcePreferences(): SharedPreferences = preferences
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        EditTextPreference(screen.context).apply {
+            key = PREF_TMDB_KEY
+            title = "TMDB API Key"
+            summary = "Used for real episode air dates. Current: %s"
+            setDefaultValue(TMDB_API_KEY_DEFAULT)
+            dialogTitle = "TMDB API Key"
+        }.also { screen.addPreference(it) }
+    }
 
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
@@ -208,6 +235,12 @@ class ToonStream : AnimeHttpSource() {
         // list (same convention as the MovieBox extension).
         val multiSeason = (all.maxOfOrNull { it.season } ?: 1) > 1
 
+        // Real air dates from TMDB (the site itself exposes no dates). Shows
+        // that can't be found fall back to "unknown" (0) instead of a fake
+        // "just now" timestamp.
+        val seriesTitle = document.selectFirst("h1.entry-title")?.text()?.trim().orEmpty()
+        val airDates = resolveEpisodeDates(seriesTitle, all.maxOfOrNull { it.season } ?: 1)
+
         // Newest episode first: latest season on top, highest episode within it.
         return all
             .sortedWith(compareByDescending<EpisodeInfo> { it.season }.thenByDescending { it.num })
@@ -225,9 +258,73 @@ class ToonStream : AnimeHttpSource() {
                     // season makes the app report thousands of "missing"
                     // episodes between season boundaries.
                     episode_number = info.num.toFloat()
-                    date_upload = System.currentTimeMillis()
+                    date_upload = airDates[Pair(info.season, info.num)] ?: 0L
                 }
             }
+    }
+
+    // ================= Episode air dates (TMDB) =================
+    // The site carries no per-episode dates anywhere, so real air dates come
+    // from TMDB (the same database the site pulls its posters from). The show
+    // is found by title search and each season's episodes are fetched once;
+    // results are cached per series for the session.
+    private val tmdbShowCache = mutableMapOf<String, Long>() // title(lower) -> tv id
+    private val tmdbDatesCache = mutableMapOf<String, Map<Pair<Int, Int>, Long>>() // title(lower) -> (season, num) -> millis
+
+    private fun tmdbApiKey(): String =
+        preferences.getString(PREF_TMDB_KEY, TMDB_API_KEY_DEFAULT).orEmpty().trim()
+
+    private fun resolveEpisodeDates(title: String, maxSeason: Int): Map<Pair<Int, Int>, Long> {
+        val cacheKey = title.lowercase()
+        tmdbDatesCache[cacheKey]?.let { return it }
+        val dates = mutableMapOf<Pair<Int, Int>, Long>()
+        val apiKey = tmdbApiKey()
+        if (apiKey.isEmpty() || title.isBlank()) return dates
+
+        val tvId = runCatching {
+            tmdbShowCache.getOrPut(cacheKey) {
+                val searchUrl = "https://api.themoviedb.org/3/search/tv" +
+                    "?api_key=$apiKey&language=en-US&query=${Uri.encode(title)}"
+                val json = JSONObject(client.newCall(GET(searchUrl)).execute().use { it.body.string() })
+                val results = json.optJSONArray("results") ?: return@getOrPut 0L
+                var first = 0L
+                var best = 0L
+                for (i in 0 until results.length()) {
+                    val result = results.getJSONObject(i)
+                    val id = result.optLong("id")
+                    if (first == 0L) first = id
+                    if (result.optString("name").equals(title, ignoreCase = true)) {
+                        best = id
+                        break
+                    }
+                }
+                if (best != 0L) best else first
+            }
+        }.getOrDefault(0L)
+        if (tvId <= 0L) return dates
+
+        for (season in 1..maxSeason) {
+            runCatching {
+                val seasonUrl = "https://api.themoviedb.org/3/tv/$tvId/season/$season" +
+                    "?api_key=$apiKey&language=en-US"
+                val json = JSONObject(client.newCall(GET(seasonUrl)).execute().use { it.body.string() })
+                val episodes = json.getJSONArray("episodes")
+                for (i in 0 until episodes.length()) {
+                    val ep = episodes.getJSONObject(i)
+                    val num = ep.optInt("episode_number", -1)
+                    val air = ep.optString("air_date")
+                    if (num <= 0 || air.isBlank()) continue
+                    val millis = runCatching {
+                        SimpleDateFormat("yyyy-MM-dd", Locale.US)
+                            .apply { timeZone = TimeZone.getTimeZone("UTC") }
+                            .parse(air)!!.time
+                    }.getOrDefault(0L)
+                    if (millis > 0L) dates[Pair(season, num)] = millis
+                }
+            }
+        }
+        tmdbDatesCache[cacheKey] = dates
+        return dates
     }
 
     // ============================== Video Streams ==============================
@@ -956,6 +1053,12 @@ class ToonStream : AnimeHttpSource() {
     private val DEAD_SOURCE_KEYS = listOf("flmn", "kknfl")
 
     companion object {
+        private const val PREF_TMDB_KEY = "tmdb_api_key"
+
+        // Public key from TMDB's open-source sample apps (embedded in many OSS
+        // projects); users can override it in the source settings.
+        private const val TMDB_API_KEY_DEFAULT = "3fd2be6f0c70a2a598f084ddfb75487c"
+
         // /episode/<series-slug>-<season>x<episode>/
         private val EPISODE_URL_REGEX = Regex("""/episode/(.+?)-(\d+)x(\d+)/?$""")
     }
