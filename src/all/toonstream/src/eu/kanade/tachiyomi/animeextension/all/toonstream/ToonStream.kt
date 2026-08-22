@@ -9,9 +9,11 @@ import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.Request
@@ -294,8 +296,11 @@ class ToonStream : AnimeHttpSource() {
 
     /**
      * Expands an HLS master playlist into one Video per quality variant
-     * (360p/480p/720p/1080p) so the app shows a real quality picker. Falls
-     * back to the master URL itself (adaptive/auto) when parsing fails.
+     * (360p/480p/720p/1080p) so the app shows a real quality picker, plus an
+     * "Auto" master entry whose in-player track selector exposes every
+     * quality AND the dual-audio renditions (Hindi/Japanese). Audio
+     * renditions are also attached as audioTracks, which AniZen lists in its
+     * audio selection sheet.
      */
     private fun buildHlsVideos(
         masterUrl: String,
@@ -310,15 +315,44 @@ class ToonStream : AnimeHttpSource() {
             }
         }.getOrNull()
         val variants = playlist?.let(::parseHlsVariants).orEmpty()
+        val audioTracks = playlist?.let(::parseHlsAudio).orEmpty()
 
-        if (variants.isNotEmpty()) {
-            variants.forEach { (label, url) ->
-                videos += Video(url, "$serverName • $label", url, headers = reqHeaders, subtitleTracks = tracks)
-            }
-        } else {
-            videos += Video(masterUrl, "$serverName (Auto)", masterUrl, headers = reqHeaders, subtitleTracks = tracks)
+        variants.forEach { (label, url) ->
+            videos += Video(
+                url,
+                "$serverName • $label",
+                url,
+                headers = reqHeaders,
+                subtitleTracks = tracks,
+                audioTracks = audioTracks,
+            )
         }
+        // The adaptive master lets the player switch quality on the fly and
+        // natively exposes both audio languages.
+        videos += Video(
+            masterUrl,
+            "$serverName • Auto",
+            masterUrl,
+            headers = reqHeaders,
+            subtitleTracks = tracks,
+            audioTracks = audioTracks,
+        )
         return videos
+    }
+
+    /**
+     * Parses #EXT-X-MEDIA:TYPE=AUDIO entries of a master playlist into
+     * Tracks (e.g. the Hindi/Japanese dual-audio renditions).
+     */
+    private fun parseHlsAudio(playlist: String): List<Track> {
+        val out = mutableListOf<Track>()
+        Regex("#EXT-X-MEDIA:TYPE=AUDIO[^\\r\\n]*").findAll(playlist).forEach { match ->
+            val line = match.value
+            val name = Regex("NAME=\"([^\"]+)\"").find(line)?.groupValues?.get(1) ?: return@forEach
+            val uri = Regex("URI=\"([^\"]+)\"").find(line)?.groupValues?.get(1) ?: return@forEach
+            out += Track(uri, name)
+        }
+        return out.distinctBy { it.url }
     }
 
     /**
@@ -358,13 +392,17 @@ class ToonStream : AnimeHttpSource() {
             token.takeIf { it.isNotEmpty() && !it.startsWith("http") }
         }
 
-        // Resolve every server in parallel. Sequential resolution meant 8+
-        // network round trips before anything showed up - opening an episode
-        // took forever compared to the site's own player.
+        // Resolve every server in parallel on the IO pool. Blocking OkHttp
+        // calls inside plain `async` on runBlocking's single thread would run
+        // sequentially - Dispatchers.IO is what makes this actually parallel.
+        // Each server also gets a hard timeout so one dead hoster can never
+        // stall the whole list again.
         val perServer: List<List<Video>> = runBlocking {
             tokens.map { token ->
-                async {
-                    runCatching { resolveEmbedServer(token, episodeUrl) }.getOrDefault(emptyList())
+                async(Dispatchers.IO) {
+                    withTimeoutOrNull(12_000L) {
+                        runCatching { resolveEmbedServer(token, episodeUrl) }.getOrDefault(emptyList())
+                    }.orEmpty()
                 }
             }.awaitAll()
         }
@@ -463,27 +501,37 @@ class ToonStream : AnimeHttpSource() {
             }
         }
 
-        for (match in sourcesRegex.findAll(apiResponse)) {
-            val sourceKey = match.groupValues[1]
-            val siteUrl = match.groupValues[2].replace("\\/", "/")
-            val fileCode = fileCodes[sourceKey] ?: continue
-            val friendlyName = getFriendlyName(sourceKey)
-            runCatching {
-                val sourceHeaders = headers.newBuilder()
-                    .set("Referer", "https://gdmirrorbot.nl/embed/$embedId")
-                    .build()
-                val playerUrl = "$siteUrl$fileCode"
-                val playerHtml = client.newCall(GET(playerUrl, sourceHeaders)).execute().use {
-                    it.body.string()
+        // Resolve each source's player page in parallel on the IO pool, with
+        // the same per-server timeout as everything else.
+        val resolved: List<List<Video>> = runBlocking {
+            sourcesRegex.findAll(apiResponse).mapNotNull { match ->
+                val sourceKey = match.groupValues[1]
+                val siteUrl = match.groupValues[2].replace("\\/", "/")
+                val fileCode = fileCodes[sourceKey] ?: return@mapNotNull null
+                val friendlyName = getFriendlyName(sourceKey)
+                async(Dispatchers.IO) {
+                    withTimeoutOrNull(12_000L) {
+                        runCatching {
+                            val sourceHeaders = headers.newBuilder()
+                                .set("Referer", "https://gdmirrorbot.nl/embed/$embedId")
+                                .build()
+                            val playerUrl = "$siteUrl$fileCode"
+                            val playerHtml = client.newCall(GET(playerUrl, sourceHeaders)).execute().use {
+                                it.body.string()
+                            }
+                            // The player page packs its JWPlayer config with a
+                            // Dean Edwards packer containing HLS URLs.
+                            val masterUrl = decodePackedStreamUrl(playerHtml)
+                                ?: return@runCatching emptyList<Video>()
+                            val captions = decodeCaptions(playerHtml).filter { it.second.endsWith(".vtt") }
+                            val tracks = captions.map { Track(it.second, it.first) }
+                            buildHlsVideos(masterUrl, friendlyName, sourceHeaders, tracks)
+                        }.getOrDefault(emptyList())
+                    }.orEmpty()
                 }
-                // The player page packs its JWPlayer config with a Dean Edwards
-                // packer (eval(function(p,a,c,k,e,d))) containing HLS URLs.
-                val masterUrl = decodePackedStreamUrl(playerHtml) ?: return@runCatching
-                val captions = decodeCaptions(playerHtml).filter { it.second.endsWith(".vtt") }
-                val tracks = captions.map { Track(it.second, it.first) }
-                videos += buildHlsVideos(masterUrl, friendlyName, sourceHeaders, tracks)
-            }
+            }.toList().awaitAll()
         }
+        videos += resolved.flatten()
         return videos
     }
 
