@@ -59,10 +59,10 @@
   {
     "name": "ToonHub4u (𝕬𝕽)",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.toonhub4u",
-    "apk": "aniyomi-all.toonhub4u-v14.14-release.apk",
+    "apk": "aniyomi-all.toonhub4u-v14.15-release.apk",
     "lang": "all",
-    "code": 14,
-    "version": "14.14",
+    "code": 15,
+    "version": "14.15",
     "nsfw": 0,
     "hasReadme": 0,
     "hasChangelog": 0,
