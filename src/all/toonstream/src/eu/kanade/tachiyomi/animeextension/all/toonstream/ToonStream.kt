@@ -219,12 +219,12 @@ class ToonStream : AnimeHttpSource() {
                     } else {
                         "Episode ${info.num}"
                     }
-                    // Keep numbers unique/sortable across seasons.
-                    episode_number = if (multiSeason) {
-                        (info.season * 1000 + info.num).toFloat()
-                    } else {
-                        info.num.toFloat()
-                    }
+                    // Plain in-season number (like the MovieBox extension) -
+                    // the season switcher buttons come from the "Season X -
+                    // Episode Y" name pattern, and offsetting by 1000 per
+                    // season makes the app report thousands of "missing"
+                    // episodes between season boundaries.
+                    episode_number = info.num.toFloat()
                     date_upload = System.currentTimeMillis()
                 }
             }
@@ -507,16 +507,14 @@ class ToonStream : AnimeHttpSource() {
             }.awaitAll()
         }
 
-        // Best server first, then best quality within each server. StreamHG is
-        // the site's most reliable hoster; Turbovid serves the episode as a
-        // direct m3u8; FileLions is a backup that occasionally expires.
+        // Best server first, then best quality within each server (1080p >
+        // 720p > 480p > 360p > 240p > Auto). "Auto" has no resolution number
+        // so it sorts to the end of its server's block.
         return perServer.flatten()
             .distinctBy { it.videoUrl }
             .sortedWith(
                 compareBy<Video> { serverPriority(it.quality) }
-                    .thenByDescending { it.quality.contains("1080") }
-                    .thenByDescending { it.quality.contains("720") }
-                    .thenByDescending { it.quality.contains("480") },
+                    .thenByDescending { it.quality.substringAfter("• ").substringBefore("p").trim().toIntOrNull() ?: 0 },
             )
     }
     private fun tryGet(url: String, referer: String): String? {
