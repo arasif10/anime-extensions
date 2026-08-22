@@ -18,6 +18,7 @@ import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.Request
 import okhttp3.Response
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import rx.Observable
@@ -260,14 +261,94 @@ class ToonStream : AnimeHttpSource() {
                 val embedId = hostUrl.substringAfterLast("/")
                 resolveGdMirrorSources(embedId)
             }
+            hostUrl.contains("rubystm.com") -> {
+                // The site's "Server 1" - a filehost embed that loads the
+                // player via POST to /dl, serving a master with up to 720p
+                // and 5 audio tracks (Hindi/Tamil/Telugu/English/Japanese).
+                resolveRubyStream(hostUrl, episodeUrl)
+            }
+            hostUrl.contains("as-cdn26.top") -> {
+                // The site's "Play" server - FireVideo player with a JSON
+                // API that returns a direct HLS master (240p-1080p + 5
+                // audio tracks). This is the site's best server.
+                resolveFireVideo(hostUrl, episodeUrl)
+            }
             else -> {
                 // Best effort: some hosts embed a plain HLS/MP4 player page.
-                // (e.g. emturbovid serves the m3u8 directly in the page.)
                 tryGet(hostUrl, referer = episodeUrl)?.let {
                     extractDirectVideoUrls(it, hostUrl, episodeUrl)
                 } ?: emptyList()
             }
         }
+    }
+
+    /**
+     * FireVideo (as-cdn26.top) - the site's "Play" server. The player page
+     * alone only carries a WebTorrent fallback, but its JSON API
+     * (POST /player/index.php?data=<id>&do=getVideo) returns a direct HLS
+     * master with the full quality ladder (240p-1080p) and 5 audio tracks
+     * (Japanese/English/Telugu/Tamil/Hindi).
+     */
+    private fun resolveFireVideo(hostUrl: String, episodeUrl: String): List<Video> {
+        val id = hostUrl.substringAfterLast("/").substringBefore("?")
+        if (id.isBlank()) return emptyList()
+
+        return runCatching {
+            val form = FormBody.Builder()
+                .add("hash", id)
+                .add("r", episodeUrl)
+                .build()
+            val fvHeaders = headers.newBuilder()
+                .set("Referer", hostUrl)
+                .set("X-Requested-With", "XMLHttpRequest")
+                .withWebviewCookies("https://as-cdn26.top/")
+                .build()
+            val apiBody = client.newCall(
+                Request.Builder()
+                    .url("https://as-cdn26.top/player/index.php?data=$id&do=getVideo")
+                    .post(form)
+                    .headers(fvHeaders)
+                    .build(),
+            ).execute().use { it.body.string() }
+            val json = runCatching { JSONObject(apiBody) }.getOrNull() ?: return@runCatching emptyList<Video>()
+            val masterUrl = json.optString("videoSource", "").takeIf { it.isNotBlank() }
+                ?: return@runCatching emptyList<Video>()
+            buildHlsVideos(masterUrl, "Play", fvHeaders, emptyList())
+        }.getOrDefault(emptyList())
+    }
+
+    /**
+     * StreamRuby (rubystm.com) is a standard filehost embed: the /e/<code>
+     * page only holds a hidden form that POSTs to /dl with the file code,
+     * and the /dl response contains the packed JWPlayer config with the HLS
+     * master (variants + multi-audio renditions).
+     */
+    private fun resolveRubyStream(hostUrl: String, episodeUrl: String): List<Video> {
+        val code = hostUrl.substringAfterLast("/")
+            .substringBefore(".html")
+            .substringAfterLast("-")
+        if (code.isBlank()) return emptyList()
+
+        return runCatching {
+            val form = FormBody.Builder()
+                .add("op", "embed")
+                .add("file_code", code)
+                .add("auto", "1")
+                .add("referer", episodeUrl)
+                .build()
+            val rubyHeaders = headers.newBuilder()
+                .set("Referer", hostUrl)
+                .set("Content-Type", "application/x-www-form-urlencoded")
+                .withWebviewCookies("https://rubystm.com/")
+                .build()
+            val playerHtml = client.newCall(
+                Request.Builder().url("https://rubystm.com/dl").post(form).headers(rubyHeaders).build(),
+            ).execute().use { it.body.string() }
+
+            val masterUrl = decodePackedStreamUrl(playerHtml, "https://rubystm.com/dl")
+                ?: return@runCatching emptyList<Video>()
+            buildHlsVideos(masterUrl, "Ruby", rubyHeaders, emptyList())
+        }.getOrDefault(emptyList())
     }
 
     /**
@@ -485,6 +566,11 @@ class ToonStream : AnimeHttpSource() {
      * The gdmirrorbot endpoint 302-redirects to pro.iqsmartgames.com, which
      * rejects GET requests, so we try both URLs directly instead of relying
      * on redirect following.
+     *
+     * The API response nests the sources: {"sources":{"smwh":{"siteUrl":
+     * "https://hanerix.com/e/","friendlyName":"streamhg",...},"flmn":{...}}},
+     * plus a base64 "mresult" map of sourceKey -> fileCode. Parse it as JSON
+     * (a regex cannot handle the nesting reliably).
      */
     private fun resolveGdMirrorSources(embedId: String): List<Video> {
         val videos = mutableListOf<Video>()
@@ -515,74 +601,95 @@ class ToonStream : AnimeHttpSource() {
             }
         } ?: return videos
 
-        // Parse the JSON response to get source keys and their site URLs.
-        val sourcesRegex = Regex("""\"(\w+)\":\{[^}]*?\"siteUrl\"\s*:\s*\"([^\"]+)\"""")
-        val mresultMatch = Regex("""\"mresult\"\s*:\s*\"([^\"]+)\"""").find(apiResponse)
-        val fileCodes = mutableMapOf<String, String>()
-        if (mresultMatch != null) {
-            // mresult is base64 like {"smwh":"96vhwcxomm7l","flmn":"c8jbmkk8jpcq"}
-            val decoded = runCatching {
-                String(android.util.Base64.decode(mresultMatch.groupValues[1], android.util.Base64.DEFAULT))
-            }.getOrDefault("")
-            Regex("""\"(\w+)\"\s*:\s*\"([^\"]+)\"""").findAll(decoded).forEach { m ->
-                fileCodes[m.groupValues[1]] = m.groupValues[2]
+        val parsed = runCatching { JSONObject(apiResponse) }.getOrNull() ?: return videos
+        val sourcesObj = parsed.optJSONObject("sources") ?: return videos
+
+        // sourceKey -> fileCode, decoded from the base64 "mresult" map.
+        val fileCodes = runCatching {
+            val decoded = String(
+                android.util.Base64.decode(parsed.optString("mresult", ""), android.util.Base64.DEFAULT),
+            )
+            val map = mutableMapOf<String, String>()
+            JSONObject(decoded).keys().asSequence().forEach { key ->
+                map[key] = JSONObject(decoded).optString(key)
+            }
+            map
+        }.getOrDefault(emptyMap())
+
+        // Source key -> (player site URL, friendly label).
+        data class Source(val key: String, val siteUrl: String, val label: String)
+        val sources = mutableListOf<Source>()
+        sourcesObj.keys().asSequence().forEach { key ->
+            val sub = sourcesObj.optJSONObject(key) ?: return@forEach
+            val siteUrl = sub.optString("siteUrl", "").replace("\\/", "/")
+            if (siteUrl.isNotBlank()) {
+                val friendly = sub.optString("friendlyName", "")
+                    .takeIf { it.isNotBlank() }
+                    ?.let { getFriendlyName(it) }
+                    ?: getFriendlyName(key)
+                sources += Source(key, siteUrl, friendly)
             }
         }
+        if (sources.isEmpty()) return videos
 
         // Resolve each source's player page in parallel on the IO pool, with
         // the same per-server timeout as everything else. Filemoon (flmn) is a
-        // React SPA that serves no static player page - skip it outright.
+        // React SPA that serves no static player page and KrakenFiles (kknfl)
+        // is a file hoster with no playable stream - skip both outright.
         val resolved: List<List<Video>> = runBlocking {
-            sourcesRegex.findAll(apiResponse).mapNotNull { match ->
-                val sourceKey = match.groupValues[1]
-                if (sourceKey == "flmn") return@mapNotNull null
-                val siteUrl = match.groupValues[2].replace("\\/", "/")
-                val fileCode = fileCodes[sourceKey] ?: return@mapNotNull null
-                val friendlyName = getFriendlyName(sourceKey)
-                async(Dispatchers.IO) {
-                    withTimeoutOrNull(12_000L) {
-                        runCatching {
-                            val sourceHeaders = headers.newBuilder()
-                                .set("Referer", "https://gdmirrorbot.nl/embed/$embedId")
-                                .build()
-                            val playerUrl = "$siteUrl$fileCode"
-                            val playerHtml = client.newCall(GET(playerUrl, sourceHeaders)).execute().use {
-                                it.body.string()
-                            }
-                            // The player page packs its JWPlayer config with a
-                            // Dean Edwards packer containing HLS URLs. The site
-                            // itself picks hls4 || hls3 || hls2 - we mirror that
-                            // order and resolve relative (hls4) links against
-                            // the player page.
-                            val masterUrl = decodePackedStreamUrl(playerHtml, playerUrl)
-                                ?: return@runCatching emptyList<Video>()
-                            val captions = decodeCaptions(playerHtml).filter { it.second.endsWith(".vtt") }
-                            val tracks = captions.map { Track(it.second, it.first) }
-                            buildHlsVideos(masterUrl, friendlyName, sourceHeaders, tracks)
-                        }.getOrDefault(emptyList())
-                    }.orEmpty()
+            sources
+                .filter { it.key !in DEAD_SOURCE_KEYS }
+                .map { src ->
+                    async(Dispatchers.IO) {
+                        withTimeoutOrNull(8_000L) {
+                            runCatching {
+                                val fileCode = fileCodes[src.key] ?: return@runCatching emptyList<Video>()
+                                val sourceHeaders = headers.newBuilder()
+                                    .set("Referer", "https://gdmirrorbot.nl/embed/$embedId")
+                                    .build()
+                                val playerUrl = "${src.siteUrl}$fileCode"
+                                val playerHtml = client.newCall(GET(playerUrl, sourceHeaders)).execute().use {
+                                    it.body.string()
+                                }
+                                // The player page packs its JWPlayer config with a
+                                // Dean Edwards packer containing HLS URLs. The site
+                                // itself picks hls4 || hls3 || hls2 - we mirror that
+                                // order and resolve relative (hls4) links against
+                                // the player page. Expired/deleted files return a
+                                // bare "File is no longer available" page with no
+                                // packer, so decodePackedStreamUrl returns null and
+                                // the source is skipped.
+                                val masterUrl = decodePackedStreamUrl(playerHtml, playerUrl)
+                                    ?: return@runCatching emptyList<Video>()
+                                val captions = decodeCaptions(playerHtml).filter { it.second.endsWith(".vtt") }
+                                val tracks = captions.map { Track(it.second, it.first) }
+                                buildHlsVideos(masterUrl, src.label, sourceHeaders, tracks)
+                            }.getOrDefault(emptyList())
+                        }.orEmpty()
+                    }
                 }
-            }.toList().awaitAll()
+                .toList()
+                .awaitAll()
         }
         videos += resolved.flatten()
         return videos
     }
 
-    private fun getFriendlyName(key: String): String = when (key) {
-        "smwh" -> "StreamHG"
-        "flmn" -> "Filemoon"
-        "flls" -> "FileLions"
+    private fun getFriendlyName(key: String): String = when (key.lowercase()) {
+        "smwh", "streamhg" -> "StreamHG"
+        "flmn", "byse" -> "Filemoon"
+        "flls", "earnvids" -> "FileLions"
         "ddstm" -> "DropLoad"
         "plrx" -> "PlayerX"
         "abys" -> "Abyss"
         "strmtp" -> "StreamTape"
-        "onud" -> "UpnShare"
+        "onud", "upnshr" -> "UpnShare"
         "vdgd" -> "VDGD"
         "vosx" -> "Voe"
         "rpmshre" -> "RPMShare"
-        "kknfl" -> "KrakenFiles"
-        "upnshr" -> "UpnShare"
+        "kknfl", "krakenfiles" -> "KrakenFiles"
         "strmp2" -> "StreamP2P"
+        "mxdp" -> "MixDrop"
         else -> key.uppercase()
     }
 
@@ -823,22 +930,32 @@ class ToonStream : AnimeHttpSource() {
 
     /** Lower is better; used to order servers best-to-worst. */
     private fun serverPriority(quality: String): Int = when {
-        quality.startsWith("StreamHG") -> 0
-        quality.startsWith("Turbovid") -> 1
-        quality.startsWith("FileLions") -> 2
-        else -> 3
+        quality.startsWith("Play") -> 0
+        quality.startsWith("StreamHG") -> 1
+        quality.startsWith("Ruby") -> 2
+        quality.startsWith("FileLions") -> 3
+        quality.startsWith("vidmoly") -> 4
+        else -> 5
     }
 
     /**
      * Hosters that no longer serve playable streams (dead domains, JS-only
      * players or expired files). Skipped before any network call so opening
      * an episode never waits on them.
+     *
+     * Turbovid (emturbovid) is excluded because its "video" is actually a
+     * slideshow of PNG images hosted on Google Drive - no real video player
+     * can decode it.
      */
     private val DEAD_HOSTS = listOf(
-        "rubystm.com", "streamruby",
         "abyssplayer.com", "blakiteapi.xyz", "cloudy.upns.one", "upns.one",
-        "as-cdn26.top", "youtube.com", "youtu.be",
+        "youtube.com", "youtu.be",
+        "emturbovid.com", "turboviplay.com", "turbosplayer.com",
+        "vidstreaming.xyz", "strmup.to",
     )
+
+    /** gdmirror API source keys that never yield a playable stream. */
+    private val DEAD_SOURCE_KEYS = listOf("flmn", "kknfl")
 
     companion object {
         // /episode/<series-slug>-<season>x<episode>/
