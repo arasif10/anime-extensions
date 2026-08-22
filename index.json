@@ -74,5 +74,24 @@
         "baseUrl": "https://toonhub4u.co"
       }
     ]
+  },
+  {
+    "name": "ToonStream (𝕬𝕽)",
+    "pkg": "eu.kanade.tachiyomi.animeextension.all.toonstream",
+    "apk": "aniyomi-all.toonstream-v14.02-release.apk",
+    "lang": "all",
+    "code": 2,
+    "version": "14.02",
+    "nsfw": 0,
+    "hasReadme": 0,
+    "hasChangelog": 0,
+    "sources": [
+      {
+        "id": 4164599757938560453,
+        "lang": "all",
+        "name": "ToonStream",
+        "baseUrl": "https://toon-stream.site"
+      }
+    ]
   }
 ]
