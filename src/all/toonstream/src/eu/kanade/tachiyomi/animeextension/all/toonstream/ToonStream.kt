@@ -238,7 +238,10 @@ class ToonStream : AnimeHttpSource() {
      */
     private fun resolveEmbedServer(token: String, episodeUrl: String): List<Video> {
         val embedPage = try {
-            client.newCall(GET("$baseUrl/embed/$token", headers)).execute().use {
+            val embedHeaders = headers.newBuilder()
+                .withWebviewCookies("$baseUrl/")
+                .build()
+            client.newCall(GET("$baseUrl/embed/$token", embedHeaders)).execute().use {
                 Jsoup.parse(it.body.string(), baseUrl)
             }
         } catch (e: Exception) {
@@ -263,10 +266,25 @@ class ToonStream : AnimeHttpSource() {
             else -> {
                 // Best effort: some hosts embed a plain HLS/MP4 player page.
                 tryGet(hostUrl, referer = episodeUrl)?.let {
-                    extractDirectVideoUrls(it, hostUrl)
+                    extractDirectVideoUrls(it, hostUrl, episodeUrl)
                 } ?: emptyList()
             }
         }
+    }
+
+    /**
+     * Cloudflare fronts several of these hosters and may serve challenge
+     * pages to plain OkHttp requests (browsers pass automatically). If the
+     * host was ever opened in a WebView, its clearance cookie lives in the
+     * shared CookieManager - forward it so requests go through.
+     */
+    private fun Headers.Builder.withWebviewCookies(url: String): Headers.Builder {
+        runCatching {
+            android.webkit.CookieManager.getInstance().getCookie(url)
+                ?.takeIf { it.isNotBlank() }
+                ?.let { set("Cookie", it) }
+        }
+        return this
     }
 
     private fun resolveRubyStream(code: String, episodeUrl: String): List<Video> {
@@ -275,6 +293,7 @@ class ToonStream : AnimeHttpSource() {
             val rubyHeaders = headers.newBuilder()
                 .set("Referer", episodeUrl)
                 .set("Content-Type", "application/x-www-form-urlencoded")
+                .withWebviewCookies("https://rubystm.com/")
                 .build()
             val form = FormBody.Builder()
                 .add("op", "embed")
@@ -420,6 +439,7 @@ class ToonStream : AnimeHttpSource() {
         return runCatching {
             val requestHeaders = headers.newBuilder()
                 .set("Referer", referer)
+                .withWebviewCookies(url)
                 .build()
             client.newCall(GET(url, requestHeaders)).execute().use { response ->
                 if (!response.isSuccessful) null else response.body.string()
@@ -428,24 +448,27 @@ class ToonStream : AnimeHttpSource() {
     }
 
     /**
-     * Last-resort extractor for hosts we don't fully support: scan the player
-     * page for plain HLS/MP4 URLs (some hosts inline the stream directly).
+     * Last-resort extractor for hosts we don't fully support. Any HLS URL
+     * found (packed player or inline in the page) still goes through the
+     * quality expander so users get per-resolution entries.
      */
-    private fun extractDirectVideoUrls(html: String, hostUrl: String): List<Video> {
-        val videos = mutableListOf<Video>()
-        val hostName = runCatching { java.net.URI(hostUrl).host }.getOrNull() ?: "Server"
+    private fun extractDirectVideoUrls(html: String, hostUrl: String, referer: String): List<Video> {
+        val hostLabel = runCatching { java.net.URI(hostUrl).host ?: "Server" }.getOrNull() ?: "Server"
+        val reqHeaders = headers.newBuilder()
+            .set("Referer", referer)
+            .withWebviewCookies(hostUrl)
+            .build()
+
         // Packed player pages still work through the generic decoder.
-        decodePackedStreamUrl(html)?.let { url ->
-            videos += Video(url, "$hostName (HLS)", url)
-            return videos
+        decodePackedStreamUrl(html)?.let { master ->
+            return buildHlsVideos(master, hostLabel, reqHeaders, emptyList())
         }
-        Regex("""https?://[^"'\s<>]+\.m3u8[^"'\s<>]*""").find(html)?.let {
-            videos += Video(it.value, "$hostName (HLS)", it.value)
+        Regex("""https?://[^"'\s<>]+\.m3u8[^"'\s<>]*""").find(html)?.let { match ->
+            return buildHlsVideos(match.value, hostLabel, reqHeaders, emptyList())
         }
-        if (videos.isEmpty()) {
-            Regex("""https?://[^"'\s<>]+\.mp4[^"'\s<>]*""").find(html)?.let {
-                videos += Video(it.value, "$hostName (MP4)", it.value)
-            }
+        val videos = mutableListOf<Video>()
+        Regex("""https?://[^"'\s<>]+\.mp4[^"'\s<>]*""").find(html)?.let {
+            videos += Video(it.value, "$hostLabel (MP4)", it.value, headers = reqHeaders)
         }
         return videos
     }
@@ -476,6 +499,7 @@ class ToonStream : AnimeHttpSource() {
                     .set("Content-Type", "application/x-www-form-urlencoded")
                     .set("Origin", "https://gdmirrorbot.nl")
                     .set("Referer", "https://gdmirrorbot.nl/embed/$embedId")
+                    .withWebviewCookies("https://gdmirrorbot.nl/")
                     .build()
                 client.newCall(
                     Request.Builder().url(apiUrl).post(form).headers(apiHeaders).build(),
