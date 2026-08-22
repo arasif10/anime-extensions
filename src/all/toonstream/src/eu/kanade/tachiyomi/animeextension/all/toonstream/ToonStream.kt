@@ -233,8 +233,8 @@ class ToonStream : AnimeHttpSource() {
 
     /**
      * Resolves one /embed/<token> on toon-stream.site. The token page returns a
-     * single <iframe> pointing at the real hoster embed (rubystm, gdmirrorbot,
-     * vidmoly, youtube, ...). Each hoster is then extracted separately.
+     * single <iframe> pointing at the real hoster embed (gdmirrorbot,
+     * emturbovid, ...). Each hoster is then extracted separately.
      */
     private fun resolveEmbedServer(token: String, episodeUrl: String): List<Video> {
         val embedPage = try {
@@ -253,18 +253,16 @@ class ToonStream : AnimeHttpSource() {
         val hostUrl = iframe.attr("src").ifBlank { iframe.attr("data-src") }
         if (hostUrl.isBlank()) return emptyList()
 
+        if (DEAD_HOSTS.any { hostUrl.contains(it, ignoreCase = true) }) return emptyList()
+
         return when {
-            hostUrl.contains("rubystm.com") || hostUrl.contains("streamruby") -> {
-                val code = hostUrl.substringAfterLast("/e/").substringBefore(".html")
-                if (code.isNotBlank()) resolveRubyStream(code, episodeUrl) else emptyList()
-            }
             hostUrl.contains("gdmirrorbot.nl") -> {
                 val embedId = hostUrl.substringAfterLast("/")
                 resolveGdMirrorSources(embedId)
             }
-            hostUrl.contains("youtube") || hostUrl.contains("youtu.be") -> emptyList()
             else -> {
                 // Best effort: some hosts embed a plain HLS/MP4 player page.
+                // (e.g. emturbovid serves the m3u8 directly in the page.)
                 tryGet(hostUrl, referer = episodeUrl)?.let {
                     extractDirectVideoUrls(it, hostUrl, episodeUrl)
                 } ?: emptyList()
@@ -287,32 +285,6 @@ class ToonStream : AnimeHttpSource() {
         return this
     }
 
-    private fun resolveRubyStream(code: String, episodeUrl: String): List<Video> {
-        val videos = mutableListOf<Video>()
-        runCatching {
-            val rubyHeaders = headers.newBuilder()
-                .set("Referer", episodeUrl)
-                .set("Content-Type", "application/x-www-form-urlencoded")
-                .withWebviewCookies("https://rubystm.com/")
-                .build()
-            val form = FormBody.Builder()
-                .add("op", "embed")
-                .add("file_code", code)
-                .add("auto", "1")
-                .add("referer", episodeUrl)
-                .build()
-            val html = client.newCall(
-                Request.Builder().url("https://rubystm.com/dl").post(form).headers(rubyHeaders).build(),
-            ).execute().use { it.body.string() }
-
-            val masterUrl = decodePackedStreamUrl(html) ?: return@runCatching
-            val captions = decodeCaptions(html).filter { it.second.endsWith(".vtt") }
-            val tracks = captions.map { Track(it.second, it.first) }
-            videos += buildHlsVideos(masterUrl, "Ruby", rubyHeaders, tracks)
-        }
-        return videos
-    }
-
     /**
      * Expands an HLS master playlist into one Video per quality variant
      * (360p/480p/720p/1080p) so the app shows a real quality picker, plus an
@@ -333,8 +305,8 @@ class ToonStream : AnimeHttpSource() {
                 if (!response.isSuccessful) null else response.body.string()
             }
         }.getOrNull()
-        val variants = playlist?.let(::parseHlsVariants).orEmpty()
-        val audioTracks = playlist?.let(::parseHlsAudio).orEmpty()
+        val variants = playlist?.let { parseHlsVariants(it, masterUrl) }.orEmpty()
+        val audioTracks = playlist?.let { parseHlsAudio(it, masterUrl) }.orEmpty()
 
         variants.forEach { (label, url) ->
             videos += Video(
@@ -363,22 +335,44 @@ class ToonStream : AnimeHttpSource() {
      * Parses #EXT-X-MEDIA:TYPE=AUDIO entries of a master playlist into
      * Tracks (e.g. the Hindi/Japanese dual-audio renditions).
      */
-    private fun parseHlsAudio(playlist: String): List<Track> {
+    private fun parseHlsAudio(playlist: String, masterUrl: String): List<Track> {
         val out = mutableListOf<Track>()
         Regex("#EXT-X-MEDIA:TYPE=AUDIO[^\\r\\n]*").findAll(playlist).forEach { match ->
             val line = match.value
             val name = Regex("NAME=\"([^\"]+)\"").find(line)?.groupValues?.get(1) ?: return@forEach
+            val lang = Regex("LANGUAGE=\"([^\"]+)\"").find(line)?.groupValues?.get(1).orEmpty()
             val uri = Regex("URI=\"([^\"]+)\"").find(line)?.groupValues?.get(1) ?: return@forEach
-            out += Track(uri, name)
+            out += Track(resolveUrl(uri, masterUrl), toEnglishAudioName(name, lang))
         }
         return out.distinctBy { it.url }
+    }
+
+    /**
+     * The site's HLS masters name audio renditions in native script
+     * (हिन्दी, தமிழ், తెలుగు, 日本語...). Map those - plus the LANGUAGE
+     * attribute - to English labels for the app's audio picker.
+     */
+    private fun toEnglishAudioName(name: String, lang: String): String {
+        val byLang = mapOf(
+            "en" to "English", "hi" to "Hindi", "ta" to "Tamil", "te" to "Telugu",
+            "ja" to "Japanese", "ko" to "Korean", "zh" to "Chinese", "bn" to "Bengali",
+            "ml" to "Malayalam", "kn" to "Kannada", "mr" to "Marathi",
+        )
+        byLang[lang.lowercase()]?.let { return it }
+        val byName = mapOf(
+            "हिन्दी" to "Hindi", "हिंदी" to "Hindi", "தமிழ்" to "Tamil", "తెలుగు" to "Telugu",
+            "ಕನ್ನಡ" to "Kannada", "മലയാളം" to "Malayalam", "বাংলা" to "Bengali",
+            "मराठी" to "Marathi", "日本語" to "Japanese", "한국어" to "Korean",
+            "中文" to "Chinese", "English" to "English",
+        )
+        return byName[name.trim()] ?: name.trim()
     }
 
     /**
      * Parses #EXT-X-STREAM-INF entries of a master playlist into
      * (quality label, variant url) pairs.
      */
-    private fun parseHlsVariants(playlist: String): List<Pair<String, String>> {
+    private fun parseHlsVariants(playlist: String, masterUrl: String): List<Pair<String, String>> {
         val out = mutableListOf<Pair<String, String>>()
         var pendingHeight: String? = null
         playlist.lines().forEach { rawLine ->
@@ -389,14 +383,20 @@ class ToonStream : AnimeHttpSource() {
                 }
                 line.isNotEmpty() && !line.startsWith("#") -> {
                     val height = pendingHeight
-                    if (height != null && line.contains(".m3u8")) {
-                        out.add("${height}p" to line)
+                    if (height != null) {
+                        out.add("${height}p" to resolveUrl(line, masterUrl))
                     }
                     pendingHeight = null
                 }
             }
         }
         return out.distinctBy { it.first }
+    }
+
+    /** Resolves relative playlist/media URIs against a base (page or master) URL. */
+    private fun resolveUrl(raw: String, baseUrl: String): String {
+        if (raw.startsWith("http://") || raw.startsWith("https://")) return raw
+        return runCatching { java.net.URI(baseUrl).resolve(raw).toString() }.getOrDefault(raw)
     }
 
     override fun videoListRequest(episode: SEpisode): Request = GET(episode.url, headers)
@@ -426,11 +426,14 @@ class ToonStream : AnimeHttpSource() {
             }.awaitAll()
         }
 
-        // Best quality first so the default pick is the sharpest stream.
+        // Best server first, then best quality within each server. StreamHG is
+        // the site's most reliable hoster; Turbovid serves the episode as a
+        // direct m3u8; FileLions is a backup that occasionally expires.
         return perServer.flatten()
             .distinctBy { it.videoUrl }
             .sortedWith(
-                compareByDescending<Video> { it.quality.contains("1080") }
+                compareBy<Video> { serverPriority(it.quality) }
+                    .thenByDescending { it.quality.contains("1080") }
                     .thenByDescending { it.quality.contains("720") }
                     .thenByDescending { it.quality.contains("480") },
             )
@@ -453,14 +456,15 @@ class ToonStream : AnimeHttpSource() {
      * quality expander so users get per-resolution entries.
      */
     private fun extractDirectVideoUrls(html: String, hostUrl: String, referer: String): List<Video> {
-        val hostLabel = runCatching { java.net.URI(hostUrl).host ?: "Server" }.getOrNull() ?: "Server"
+        val host = runCatching { java.net.URI(hostUrl).host ?: "Server" }.getOrNull() ?: "Server"
+        val hostLabel = friendlyHost(host)
         val reqHeaders = headers.newBuilder()
             .set("Referer", referer)
             .withWebviewCookies(hostUrl)
             .build()
 
         // Packed player pages still work through the generic decoder.
-        decodePackedStreamUrl(html)?.let { master ->
+        decodePackedStreamUrl(html, hostUrl)?.let { master ->
             return buildHlsVideos(master, hostLabel, reqHeaders, emptyList())
         }
         Regex("""https?://[^"'\s<>]+\.m3u8[^"'\s<>]*""").find(html)?.let { match ->
@@ -491,8 +495,8 @@ class ToonStream : AnimeHttpSource() {
             .build()
 
         val apiResponse = listOf(
-            "https://gdmirrorbot.nl/embedhelper2.php",
             "https://pro.iqsmartgames.com/embedhelper2.php",
+            "https://gdmirrorbot.nl/embedhelper2.php",
         ).firstNotNullOfOrNull { apiUrl ->
             runCatching {
                 val apiHeaders = headers.newBuilder()
@@ -526,10 +530,12 @@ class ToonStream : AnimeHttpSource() {
         }
 
         // Resolve each source's player page in parallel on the IO pool, with
-        // the same per-server timeout as everything else.
+        // the same per-server timeout as everything else. Filemoon (flmn) is a
+        // React SPA that serves no static player page - skip it outright.
         val resolved: List<List<Video>> = runBlocking {
             sourcesRegex.findAll(apiResponse).mapNotNull { match ->
                 val sourceKey = match.groupValues[1]
+                if (sourceKey == "flmn") return@mapNotNull null
                 val siteUrl = match.groupValues[2].replace("\\/", "/")
                 val fileCode = fileCodes[sourceKey] ?: return@mapNotNull null
                 val friendlyName = getFriendlyName(sourceKey)
@@ -544,8 +550,11 @@ class ToonStream : AnimeHttpSource() {
                                 it.body.string()
                             }
                             // The player page packs its JWPlayer config with a
-                            // Dean Edwards packer containing HLS URLs.
-                            val masterUrl = decodePackedStreamUrl(playerHtml)
+                            // Dean Edwards packer containing HLS URLs. The site
+                            // itself picks hls4 || hls3 || hls2 - we mirror that
+                            // order and resolve relative (hls4) links against
+                            // the player page.
+                            val masterUrl = decodePackedStreamUrl(playerHtml, playerUrl)
                                 ?: return@runCatching emptyList<Video>()
                             val captions = decodeCaptions(playerHtml).filter { it.second.endsWith(".vtt") }
                             val tracks = captions.map { Track(it.second, it.first) }
@@ -581,8 +590,13 @@ class ToonStream : AnimeHttpSource() {
      * The stream source page packs its JWPlayer config with a standard Dean
      * Edwards packer. Decode the eval block and pull the HLS m3u8 URL out of
      * the JWPlayer `links`, `sources` or `file` config.
+     *
+     * The site's own player code prefers `links.hls4 || links.hls3 ||
+     * links.hls2` - we mirror that order. hls4 is usually a RELATIVE url
+     * (/stream/...) that must be resolved against the player page; hls2's
+     * tokenized premilkyway links now answer 403, so it is only a last resort.
      */
-    private fun decodePackedStreamUrl(html: String): String? {
+    private fun decodePackedStreamUrl(html: String, pageUrl: String): String? {
         var searchFrom = 0
         while (true) {
             val start = html.indexOf("eval(function(p,a,c,k,e,d)", searchFrom)
@@ -600,22 +614,28 @@ class ToonStream : AnimeHttpSource() {
                     decoded = decoded.replace(Regex("\\b" + toBase(i, radix) + "\\b"), dict[i])
                 }
             }
-            // Pattern 1: JWPlayer links JSON: "hls2":"https://...master.m3u8?t=..."
-            for (key in listOf("hls2", "hls3", "hls4", "hls")) {
-                val linkMatch = Regex("\"$key\"\\s*:\\s*\"(https?://[^\"]+)\"").find(decoded)
-                if (linkMatch != null && (linkMatch.groupValues[1].contains("m3u8") || linkMatch.groupValues[1].contains("mp4"))) {
-                    return linkMatch.groupValues[1]
+            // Pattern 1: JWPlayer links object - site order hls4, hls3, hls2, hls.
+            val linksBlock = Regex("""links\s*=\s*\{([^}]*)\}""").find(decoded)
+            if (linksBlock != null) {
+                for (key in listOf("hls4", "hls3", "hls2", "hls")) {
+                    val linkMatch = Regex("""["']?$key["']?\s*:\s*["']([^"']+)["']""").find(linksBlock.groupValues[1])
+                    if (linkMatch != null) {
+                        val raw = linkMatch.groupValues[1]
+                        if (raw.contains("m3u8") || raw.contains("master.txt") || raw.contains("mp4")) {
+                            return resolveUrl(raw, pageUrl)
+                        }
+                    }
                 }
             }
             // Pattern 2: file: "https://...m3u8" (generic JWPlayer config)
             val fileMatch = Regex("""["']?file["']?\s*:\s*"([^"]*(?:m3u8|\.mp4)[^"]*)""").find(decoded)
             if (fileMatch != null) {
-                return fileMatch.groupValues[1]
+                return resolveUrl(fileMatch.groupValues[1], pageUrl)
             }
             // Pattern 3: sources:[{file:"https://...m3u8"}]
             val sourcesMatch = Regex("""sources\s*:\s*\[\s*\{[^}]*?file\s*:\s*"([^"]+)""").find(decoded)
             if (sourcesMatch != null) {
-                return sourcesMatch.groupValues[1]
+                return resolveUrl(sourcesMatch.groupValues[1], pageUrl)
             }
             searchFrom = start + 10
         }
@@ -795,6 +815,30 @@ class ToonStream : AnimeHttpSource() {
             else -> "all"
         }
     }
+
+    private fun friendlyHost(host: String): String = when (host) {
+        "emturbovid.com" -> "Turbovid"
+        else -> host
+    }
+
+    /** Lower is better; used to order servers best-to-worst. */
+    private fun serverPriority(quality: String): Int = when {
+        quality.startsWith("StreamHG") -> 0
+        quality.startsWith("Turbovid") -> 1
+        quality.startsWith("FileLions") -> 2
+        else -> 3
+    }
+
+    /**
+     * Hosters that no longer serve playable streams (dead domains, JS-only
+     * players or expired files). Skipped before any network call so opening
+     * an episode never waits on them.
+     */
+    private val DEAD_HOSTS = listOf(
+        "rubystm.com", "streamruby",
+        "abyssplayer.com", "blakiteapi.xyz", "cloudy.upns.one", "upns.one",
+        "as-cdn26.top", "youtube.com", "youtu.be",
+    )
 
     companion object {
         // /episode/<series-slug>-<season>x<episode>/
