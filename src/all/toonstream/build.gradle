@@ -2,7 +2,7 @@ ext {
     extName = 'ToonStream'
     extLabel = 'ToonStream (𝕬𝕽)'
     extClass = '.ToonStream'
-    extVersionCode = 2
+    extVersionCode = 3
     isNsfw = false
 }
 

@@ -83,17 +83,21 @@ class ToonStream : AnimeHttpSource() {
 
     // ============================== Search ==============================
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val genre = filters.find { it is GenreFilter } as? GenreFilter
         val type = filters.find { it is TypeFilter } as? TypeFilter
+        val typeParam = type?.toParam() ?: "all"
 
-        // Empty query + genre selected -> browse the category page instead.
-        if (query.isBlank() && genre != null && genre.state > 0) {
-            val path = genre.toPath()
-            val typeParam = type?.toParam() ?: "all"
+        if (query.isBlank()) {
+            // Browse mode: whichever taxonomy filter (genre/language/network)
+            // is selected wins - the site can't combine taxonomies in one URL.
+            val path = listOf(
+                (filters.find { it is GenreFilter } as? GenreFilter)?.takeIf { it.state > 0 }?.toPath(),
+                (filters.find { it is LanguageFilter } as? LanguageFilter)?.takeIf { it.state > 0 }?.toPath(),
+                (filters.find { it is NetworkFilter } as? NetworkFilter)?.takeIf { it.state > 0 }?.toPath(),
+            ).firstOrNull { !it.isNullOrBlank() } ?: "anime"
+
             return GET("$baseUrl/category/$path?type=$typeParam&page=$page", headers)
         }
 
-        val typeParam = type?.toParam() ?: "all"
         return GET("$baseUrl/s?q=${query.trim()}&type=$typeParam&page=$page", headers)
     }
 
@@ -517,22 +521,17 @@ class ToonStream : AnimeHttpSource() {
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
         TypeFilter(),
         GenreFilter(),
+        LanguageFilter(),
+        NetworkFilter(),
     )
 
-    // The site's real category taxonomy from its navigation menus. Slugs map
-    // directly to /category/<slug> URLs.
+    // Filters mirror the site's real navigation taxonomy; slugs map directly
+    // to /category/<slug> URLs (all verified returning 200).
+
     private class GenreFilter : AnimeFilter.Select<String>(
-        "Category",
+        "Genre",
         arrayOf(
             "All",
-            // Top-level content types
-            "Anime",
-            "Cartoon",
-            "Movies",
-            "Hindi",
-            "Tamil",
-            "Telugu",
-            // Genres (site taxonomy)
             "Action",
             "Adventure",
             "Animation",
@@ -547,10 +546,74 @@ class ToonStream : AnimeHttpSource() {
             "Mystery",
             "Romance",
             "Sci-fi",
+            "Sci-Fi & Fantasy",
             "Superhero",
             "Thriller",
             "War",
-            // Networks
+        ),
+    ) {
+        fun toPath() = when (state) {
+            1 -> "action"
+            2 -> "adventure"
+            3 -> "animation"
+            4 -> "comedy"
+            5 -> "crime"
+            6 -> "drama"
+            7 -> "family"
+            8 -> "fantasy"
+            9 -> "horror"
+            10 -> "kids"
+            11 -> "martial-art"
+            12 -> "mystery"
+            13 -> "romance"
+            14 -> "sci-fi"
+            15 -> "sci-fi-fantasy"
+            16 -> "superhero"
+            17 -> "thriller"
+            18 -> "war"
+            else -> ""
+        }
+    }
+
+    private class LanguageFilter : AnimeFilter.Select<String>(
+        "Language",
+        arrayOf(
+            "All",
+            "Hindi",
+            "Tamil",
+            "Telugu",
+            "Fan Hindi",
+            "Malayalam",
+            "Kannada",
+            "Bengali",
+            "Marathi",
+            "English",
+            "Japanese",
+            "Korean",
+            "Chinese",
+        ),
+    ) {
+        fun toPath() = when (state) {
+            1 -> "language/hindi-language"
+            2 -> "language/tamil-language"
+            3 -> "language/telugu"
+            4 -> "language/fan-hindi"
+            5 -> "language/malyalam"
+            6 -> "language/kannada"
+            7 -> "language/bengali"
+            8 -> "language/marathi"
+            9 -> "language/english"
+            10 -> "language/japaneses"
+            11 -> "language/korean"
+            12 -> "language/chinese"
+            else -> ""
+        }
+    }
+
+    private class NetworkFilter : AnimeFilter.Select<String>(
+        "Network",
+        arrayOf(
+            "All",
             "Crunchyroll",
             "Netflix",
             "Disney",
@@ -559,40 +622,19 @@ class ToonStream : AnimeHttpSource() {
             "Sony Yay",
             "Hungama",
             "ETV Bal Bharti",
+            "Kids Zone Plus",
         ),
     ) {
         fun toPath() = when (state) {
-            1 -> "anime"
-            2 -> "cartoon"
-            3 -> "movies"
-            4 -> "hindi"
-            5 -> "tamil"
-            6 -> "telugu"
-            7 -> "action"
-            8 -> "adventure"
-            9 -> "animation"
-            10 -> "comedy"
-            11 -> "crime"
-            12 -> "drama"
-            13 -> "family"
-            14 -> "fantasy"
-            15 -> "horror"
-            16 -> "kids"
-            17 -> "martial-art"
-            18 -> "mystery"
-            19 -> "romance"
-            20 -> "sci-fi"
-            21 -> "superhero"
-            22 -> "thriller"
-            23 -> "war"
-            24 -> "crunchyroll"
-            25 -> "netflix"
-            26 -> "disney"
-            27 -> "cartoon-network"
-            28 -> "nickelodean"
-            29 -> "sony-yay"
-            30 -> "hungama"
-            31 -> "etv-bal-bharti"
+            1 -> "crunchyroll"
+            2 -> "netflix"
+            3 -> "disney"
+            4 -> "cartoon-network"
+            5 -> "nickelodean"
+            6 -> "sony-yay"
+            7 -> "hungama"
+            8 -> "etv-bal-bharti"
+            9 -> "kinds-zone-pluse"
             else -> ""
         }
     }
