@@ -1,0 +1,9 @@
+ext {
+    extName = 'ToonStream'
+    extLabel = 'ToonStream (𝕬𝕽)'
+    extClass = '.ToonStream'
+    extVersionCode = 1
+    isNsfw = false
+}
+
+apply from: "$rootDir/common.gradle"
