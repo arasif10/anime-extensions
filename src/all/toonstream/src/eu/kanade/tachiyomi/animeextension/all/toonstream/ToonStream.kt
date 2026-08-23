@@ -75,21 +75,49 @@ class ToonStream : ConfigurableAnimeSource, AnimeHttpSource() {
         return GET("$baseUrl/category/anime?type=all&page=$page", headers)
     }
 
-    override fun popularAnimeParse(response: Response): AnimesPage = parsePostList(response)
+    override fun popularAnimeParse(response: Response): AnimesPage {
+        val page = parsePostList(response)
+        if (page.animes.isEmpty()) return page
+        // The site's only feed is newest-first; rank each page by real TMDB
+        // popularity so Popular is a genuinely different list from Latest.
+        // The lookup is cached per title and fails open (site order) on error.
+        val ranked = runBlocking {
+            page.animes.map { anime ->
+                async(Dispatchers.IO) { anime to tmdbPopularity(anime.title) }
+            }.awaitAll()
+                .sortedByDescending { it.second }
+                .map { it.first }
+        }
+        return AnimesPage(ranked, page.hasNextPage)
+    }
 
     // ============================== Latest Updates ==============================
+    // The site has exactly one feed: /home lists the latest episode posts (which
+    // collapse to ~50 series) and /category/anime?type=all paginates the same
+    // catalogue 16 per page. There is no separate "popular" or sortable list.
+    //   - Latest = /home page 1 (real latest), then the catalogue continues with
+    //     anything already shown on page 1 filtered out. hasNextPage stays true
+    //     so the app keeps paging (infinite scroll).
+    //   - Popular = the same catalogue, but each page is re-ranked by real TMDB
+    //     popularity so it is genuinely different from Latest.
     override fun latestUpdatesRequest(page: Int): Request {
-        // Page 1 is the site's real "latest episodes" feed (/home), later pages
-        // continue through the anime catalogue to keep pagination working.
         return if (page == 1) {
             GET("$baseUrl/home", headers)
         } else {
-            GET("$baseUrl/category/anime?type=all&page=${page - 1}", headers)
+            // Page 2+ continue the catalogue; skip page 1 of it since /home
+            // already shows the freshest items.
+            GET("$baseUrl/category/anime?type=all&page=$page", headers)
         }
     }
 
+    private val latestPage1Urls = mutableSetOf<String>()
+
     override fun latestUpdatesParse(response: Response): AnimesPage {
-        if (!response.request.url.encodedPath.endsWith("/home")) return parsePostList(response)
+        if (!response.request.url.encodedPath.endsWith("/home")) {
+            val page = parsePostList(response)
+            val fresh = page.animes.filterNot { it.url in latestPage1Urls }
+            return AnimesPage(fresh, page.hasNextPage)
+        }
         val document = Jsoup.parse(response.body.string(), baseUrl)
         val items = document.select("article.post").mapNotNull { article ->
             val link = article.selectFirst("a.lnk-blk[href*='/episode/']") ?: return@mapNotNull null
@@ -111,7 +139,12 @@ class ToonStream : ConfigurableAnimeSource, AnimeHttpSource() {
         }
 
         val seen = LinkedHashSet<String>()
-        return AnimesPage(items.filter { seen.add(it.url) }, false)
+        val unique = items.filter { seen.add(it.url) }
+        // Remember what page 1 showed so later catalogue pages don't repeat it.
+        latestPage1Urls.clear()
+        latestPage1Urls.addAll(unique.map { it.url })
+        // The catalogue continues past /home, so keep paging on.
+        return AnimesPage(unique, true)
     }
 
     // ============================== Search ==============================
@@ -270,9 +303,41 @@ class ToonStream : ConfigurableAnimeSource, AnimeHttpSource() {
     // results are cached per series for the session.
     private val tmdbShowCache = mutableMapOf<String, Long>() // title(lower) -> tv id
     private val tmdbDatesCache = mutableMapOf<String, Map<Pair<Int, Int>, Long>>() // title(lower) -> (season, num) -> millis
+    private val tmdbPopularityCache = mutableMapOf<String, Double>() // title(lower) -> popularity
 
     private fun tmdbApiKey(): String =
         preferences.getString(PREF_TMDB_KEY, TMDB_API_KEY_DEFAULT).orEmpty().trim()
+
+    /**
+     * TMDB "popularity" score for a title (used to give the Popular tab a real
+     * ranking since the site itself has only one newest-first feed). The search
+     * is cached per title and fails open with 0.0.
+     */
+    private fun tmdbPopularity(title: String): Double {
+        val cacheKey = title.lowercase()
+        tmdbPopularityCache[cacheKey]?.let { return it }
+        val apiKey = tmdbApiKey()
+        if (apiKey.isEmpty() || title.isBlank()) return 0.0
+        val pop = runCatching {
+            val searchUrl = "https://api.themoviedb.org/3/search/tv" +
+                "?api_key=$apiKey&language=en-US&query=${Uri.encode(title)}"
+            val json = JSONObject(client.newCall(GET(searchUrl)).execute().use { it.body.string() })
+            val results = json.optJSONArray("results") ?: return@runCatching 0.0
+            var best = 0.0
+            for (i in 0 until results.length()) {
+                val result = results.getJSONObject(i)
+                val pop = result.optDouble("popularity", 0.0)
+                if (result.optString("name").equals(title, ignoreCase = true)) {
+                    best = pop
+                    break
+                }
+                if (i == 0) best = pop
+            }
+            best
+        }.getOrDefault(0.0)
+        tmdbPopularityCache[cacheKey] = pop
+        return pop
+    }
 
     private fun resolveEpisodeDates(title: String, maxSeason: Int): Map<Pair<Int, Int>, Long> {
         val cacheKey = title.lowercase()
