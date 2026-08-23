@@ -78,10 +78,10 @@
   {
     "name": "ToonStream (𝕬𝕽)",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.toonstream",
-    "apk": "aniyomi-all.toonstream-v14.12-release.apk",
+    "apk": "aniyomi-all.toonstream-v14.13-release.apk",
     "lang": "all",
-    "code": 12,
-    "version": "14.12",
+    "code": 13,
+    "version": "14.13",
     "nsfw": 0,
     "hasReadme": 0,
     "hasChangelog": 0,
