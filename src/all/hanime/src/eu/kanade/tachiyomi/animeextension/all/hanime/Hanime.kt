@@ -116,7 +116,13 @@ class Hanime : AnimeHttpSource() {
     }
 
     private fun parseCatalog(body: String): List<CatalogEntry> {
-        val jsonArray = JSONArray(body)
+        // The guest search API now wraps the list in {"data":[...],"ads":{...}};
+        // older responses were a bare array. Tolerate both.
+        val jsonArray = if (body.trimStart().startsWith("{")) {
+            JSONObject(body).optJSONArray("data") ?: JSONArray()
+        } else {
+            JSONArray(body)
+        }
         return buildList {
             for (i in 0 until jsonArray.length()) {
                 val obj = jsonArray.getJSONObject(i)
