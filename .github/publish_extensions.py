@@ -87,7 +87,7 @@ def main():
     apks = find_apks(apk_dir)
     if args.only:
         wanted = {s.strip() for s in args.only.split(",") if s.strip()}
-        apks = {s: v for s, v in apks.items() if s in wanted}
+        apks = {s: v for s, v in apks.items() if s.split(".")[-1] in wanted}
     if not apks:
         sys.exit("error: no extension release APKs found in " + str(apk_dir))
 

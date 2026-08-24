@@ -56,11 +56,12 @@ jobs:
           path: '**/build/outputs/apk/**/*.apk'
 
   publish:
-    # Publish the freshly built APKs to the public arasif10/anime-extensions repo so
-    # AniZen users can update. Needs EXTENSIONS_REPO_TOKEN (a PAT with write
-    # access to arasif10/anime-extensions) stored in this repo's secrets. Steps are
-    # gated on it so the job no-ops (skipped) until the secret is configured -
-    # job-level "if" cannot reference secrets, so it is exposed via env instead.
+    # Publish built APKs to two public repos: NSFW extensions (Hanime) go to
+    # arasif10/hanime-extensions, safe extensions go to arasif10/anime-extensions.
+    # Needs EXTENSIONS_REPO_TOKEN (a PAT with write access to both repos) stored
+    # in this repo's secrets. Steps are gated on it so the job no-ops (skipped)
+    # until the secret is configured - job-level "if" cannot reference secrets,
+    # so it is exposed via env instead.
     needs: build
     runs-on: ubuntu-latest
 
