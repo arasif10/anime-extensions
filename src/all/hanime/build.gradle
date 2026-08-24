@@ -1,8 +1,0 @@
-ext {
-    extName = 'Hanime'
-    extLabel = 'Hanime (𝕬𝕽)'
-    extClass = '.Hanime'
-    extVersionCode = 28
-}
-
-apply from: "$rootDir/common.gradle"
