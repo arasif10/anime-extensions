@@ -76,13 +76,6 @@ jobs:
           name: extension-apk
           path: apks
 
-      - name: Clone extensions repo
-        if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
-        run: |
-          git clone --quiet --branch repo \
-            "https://x-access-token:${EXTENSIONS_REPO_TOKEN}@github.com/arasif10/anime-extensions.git" \
-            extensions-repo
-
       - name: Collect extension icons
         if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
         run: |
@@ -96,6 +89,31 @@ jobs:
           done
           ls -la icons
 
-      - name: Publish APKs and update index
+      # NSFW extensions (Hanime and future) publish to arasif10/hanime-extensions.
+      - name: Clone hanime-extensions repo (NSFW)
+        if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
+        run: |
+          git clone --quiet --branch repo \
+            "https://x-access-token:${EXTENSIONS_REPO_TOKEN}@github.com/arasif10/hanime-extensions.git" \
+            hanime-repo || true
+
+      - name: Publish NSFW extensions (hanime)
+        if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
+        run: |
+          if [ -d hanime-repo ] && [ -f hanime-repo/index.min.json ]; then
+            python .github/publish_extensions.py --apk-dir apks --extensions-repo hanime-repo --icons-dir icons --only hanime
+          else
+            echo "hanime-extensions repo not initialized yet (no repo branch) - skipping"
+          fi
+
+      # Safe extensions publish to arasif10/anime-extensions.
+      - name: Clone anime-extensions repo (safe)
+        if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
+        run: |
+          git clone --quiet --branch repo \
+            "https://x-access-token:${EXTENSIONS_REPO_TOKEN}@github.com/arasif10/anime-extensions.git" \
+            extensions-repo
+
+      - name: Publish safe extensions
         if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
         run: python .github/publish_extensions.py --apk-dir apks --extensions-repo extensions-repo --icons-dir icons
