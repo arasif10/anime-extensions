@@ -63,18 +63,31 @@ android {
 
     signingConfigs {
         release {
-            if (rootProject.file("signingkey.jks").exists()) {
-                storeFile rootProject.file("signingkey.jks")
-                storePassword System.getenv("KEY_STORE_PASSWORD")
-                keyAlias System.getenv("ALIAS")
-                keyPassword System.getenv("KEY_PASSWORD")
+            // NSFW extensions (hanime) use a separate signing key so AniZen
+            // treats the hanime-extensions repo as a distinct repo from the
+            // safe anime-extensions repo.
+            def isNsfw = project.name == "hanime"
+            def keyFile = isNsfw && rootProject.file("hanime-signingkey.jks").exists()
+                ? rootProject.file("hanime-signingkey.jks")
+                : rootProject.file("signingkey.jks")
+            if (keyFile.exists()) {
+                storeFile keyFile
+                if (isNsfw && rootProject.file("hanime-signingkey.jks").exists()) {
+                    storePassword System.getenv("HANIME_KEY_STORE_PASSWORD")
+                    keyAlias System.getenv("HANIME_ALIAS")
+                    keyPassword System.getenv("HANIME_KEY_PASSWORD")
+                } else {
+                    storePassword System.getenv("KEY_STORE_PASSWORD")
+                    keyAlias System.getenv("ALIAS")
+                    keyPassword System.getenv("KEY_PASSWORD")
+                }
             }
         }
     }
 
     buildTypes {
         release {
-            if (rootProject.file("signingkey.jks").exists()) {
+            if (rootProject.file("signingkey.jks").exists() || rootProject.file("hanime-signingkey.jks").exists()) {
                 signingConfig signingConfigs.release
             } else {
                 signingConfig signingConfigs.debug

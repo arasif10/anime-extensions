@@ -11,6 +11,9 @@ env:
   KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
   KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
   ALIAS: ${{ secrets.ALIAS }}
+  HANIME_KEY_STORE_PASSWORD: ${{ secrets.HANIME_KEY_STORE_PASSWORD }}
+  HANIME_KEY_PASSWORD: ${{ secrets.HANIME_KEY_PASSWORD }}
+  HANIME_ALIAS: ${{ secrets.HANIME_ALIAS }}
   EXTENSIONS_REPO_TOKEN: ${{ secrets.EXTENSIONS_REPO_TOKEN }}
 
 jobs:
@@ -27,8 +30,9 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Restore signing keystore
+      - name: Restore signing keystores
         run: |
+          # Safe-extensions key (required)
           if [ -z "${{ secrets.SIGNING_KEY }}" ]; then
             echo "::error::SIGNING_KEY secret is missing or empty; cannot sign release APKs"
             exit 1
@@ -39,6 +43,17 @@ jobs:
             exit 1
           }
           ls -la signingkey.jks
+
+          # NSFW-extensions key (optional - only needed for hanime)
+          if [ -n "${{ secrets.HANIME_SIGNING_KEY }}" ]; then
+            echo "${{ secrets.HANIME_SIGNING_KEY }}" | base64 -d > hanime-signingkey.jks
+            test -s hanime-signingkey.jks || {
+              echo "::warning::HANIME_SIGNING_KEY decoded to empty; hanime will fall back to debug signing"
+            }
+            ls -la hanime-signingkey.jks
+          else
+            echo "::warning::HANIME_SIGNING_KEY secret not set; hanime will fall back to safe key"
+          fi
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
