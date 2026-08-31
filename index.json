@@ -30,7 +30,7 @@
     "hasChangelog": 0,
     "sources": [
       {
-        "id": 3508466391484419848,
+        "id": 3508466391484420000,
         "lang": "all",
         "name": "MovieBox",
         "baseUrl": "https://moviebox.ph"
@@ -49,7 +49,7 @@
     "hasChangelog": 0,
     "sources": [
       {
-        "id": 2128601802998256037,
+        "id": 2128601802998256000,
         "lang": "all",
         "name": "ToonHub4u",
         "baseUrl": "https://toonhub4u.co"
@@ -68,10 +68,29 @@
     "hasChangelog": 0,
     "sources": [
       {
-        "id": 4164599757938560453,
+        "id": 4164599757938560500,
         "lang": "all",
         "name": "ToonStream",
         "baseUrl": "https://toon-stream.site"
+      }
+    ]
+  },
+  {
+    "name": "ReAnime (𝕬𝕽)",
+    "pkg": "eu.kanade.tachiyomi.animeextension.en.reanime",
+    "apk": "aniyomi-en.reanime-v14.01-release.apk",
+    "lang": "en",
+    "code": 1,
+    "version": "14.01",
+    "nsfw": 0,
+    "hasReadme": 0,
+    "hasChangelog": 0,
+    "sources": [
+      {
+        "id": 7842916538472911000,
+        "lang": "en",
+        "name": "ReAnime",
+        "baseUrl": "https://reanime.to"
       }
     ]
   }
