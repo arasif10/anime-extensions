@@ -82,11 +82,12 @@ jobs:
       - name: Collect extension icons
         run: |
           mkdir -p icons
-          for dir in src/all/*/; do
+          for dir in src/*/*/; do
+            lang=$(basename "$(dirname "$dir")")
             ext=$(basename "$dir")
             icon="$dir/res/mipmap-xxxhdpi/ic_launcher.png"
             if [ -f "$icon" ]; then
-              cp "$icon" "icons/all.$ext.png"
+              cp "$icon" "icons/$lang.$ext.png"
             fi
           done
           ls -la icons
