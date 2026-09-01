@@ -378,6 +378,11 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
                     else -> null
                 }
                 date_upload = try { dateFormat.parse(ep.aired ?: "")?.time ?: 0L } catch (_: Exception) { 0L }
+                // Set episode thumbnail via reflection — lib v14 SEpisode doesn't
+                // have thumbnail_url but AniZen's runtime does (v16 setter).
+                ep.thumbnail?.takeIf { it.isNotBlank() }?.let {
+                    setEpisodeField(this, "thumbnail_url", it)
+                }
             }
         }.reversed()
     }
@@ -385,17 +390,24 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
     // ============================== Video Streams ==============================
     // The original Keiyoushi extension uses getHosterList/getVideoList (AniZen
     // Hoster API). This adaptation folds both into videoListRequest/videoListParse
-    // for lib v14 compatibility.
+    // for lib v14 compatibility. The request itself fetches the episode page HTML
+    // (needed for AniZen's Referer chain); videoListParse extracts the episode
+    // slug from the URL and does the real video server lookup.
 
-    override fun videoListRequest(episode: SEpisode): Request =
-        GET(baseUrl, headersBuilder().add("X-Tachiyomi-Episode-Url", episode.url).build())
+    override fun videoListRequest(episode: SEpisode): Request {
+        // episode.url is "slug/ep-N" — build the watch page URL
+        val (slug, epId) = episode.url.split("/", limit = 2)
+            .let { it.getOrNull(0) to (it.getOrNull(1) ?: "") }
+        val epNumber = epId.removePrefix("ep-")
+        val watchUrl = "$baseUrl/watch/$slug?ep=$epNumber"
+        return GET(watchUrl, apiHeaders(watchUrl))
+    }
 
     override fun videoListParse(response: Response): List<Video> {
-        val episodeUrl = response.request.header("X-Tachiyomi-Episode-Url") ?: return emptyList()
-        val bits = episodeUrl.split("/")
-        val slug = bits.getOrNull(0) ?: ""
-        val epId = bits.getOrNull(1) ?: ""
-        val epNumber = epId.removePrefix("ep-")
+        // Extract slug and ep number from the watch URL we requested
+        val requestUrl = response.request.url.toString()
+        val slug = requestUrl.substringAfter("/watch/").substringBefore("?")
+        val epNumber = requestUrl.substringAfter("ep=").substringBefore("&").ifBlank { "1" }
 
         val meta = animeMetaCache.get(slug) ?: fetchAnimeMeta(slug)
         if (meta == null || meta.anilistId <= 0) return emptyList()
@@ -411,16 +423,30 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
         }
         if (parsed.success != true || parsed.servers.isNullOrEmpty()) return emptyList()
 
-        val targetServers = parsed.servers.distinctBy { it.dataLink }
-        val videos = targetServers.mapNotNull { server ->
+        // Dedup by dataLink + dataType so both sub and dub servers survive.
+        // The API returns separate server entries for sub/dub with the same
+        // dataLink — deduping by dataLink alone would silently drop dub.
+        val targetServers = parsed.servers.distinctBy { "${it.dataLink}-${it.dataType}" }
+
+        // Apply preferredServer filter if set (e.g. only use HD-1 servers)
+        val serverPref = preferredServer.takeIf { it.isNotBlank() }
+        val filteredServers = if (serverPref != null) {
+            val matched = targetServers.filter { it.serverName?.equals(serverPref, true) == true }
+            if (matched.isNotEmpty()) matched else targetServers
+        } else {
+            targetServers
+        }
+
+        val videos = filteredServers.mapNotNull { server ->
             val dataLink = server.dataLink ?: return@mapNotNull null
-            runCatching { extractFromServer(dataLink, referer) }.getOrDefault(emptyList())
+            val audioType = server.dataType ?: "sub"
+            runCatching { extractFromServer(dataLink, audioType) }.getOrDefault(emptyList())
         }.flatten()
 
         return sortVideos(videos)
     }
 
-    private fun extractFromServer(dataLink: String, referer: String): List<Video> {
+    private fun extractFromServer(dataLink: String, audioType: String): List<Video> {
         val flixHeaders = headers.newBuilder()
             .add("Accept", "*/*")
             .add("Origin", flixCloudUrl)
@@ -506,6 +532,7 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
             val localManifestUrl = server.createProxyUrl(streamUrl, wPayload)
             // Fetch the proxied master playlist and extract variants directly
             val masterText = client.newCall(GET(localManifestUrl, headers)).execute().use { it.body.string() }
+            val audioLabel = if (audioType.equals("dub", true)) "Dub" else "Sub"
             val variants = STREAM_INF_REGEX.findAll(masterText).mapNotNull { match ->
                 val attributes = match.groupValues[1]
                 match.groupValues[2].trim().takeIf { it.isNotBlank() && !it.startsWith("#") } ?: return@mapNotNull null
@@ -513,13 +540,13 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
                     ?: attributes.hlsAttr("BANDWIDTH")?.toLongOrNull()?.let { "${it / 1000} kbps" } ?: "Auto"
                 Video(
                     url = localManifestUrl,
-                    quality = label,
+                    quality = "$label $audioLabel",
                     videoUrl = localManifestUrl,
                     headers = headers,
                     subtitleTracks = subtitleTracks,
                 )
             }.toList()
-            return variants.ifEmpty { listOf(Video(localManifestUrl, "Auto", localManifestUrl, headers = headers, subtitleTracks = subtitleTracks)) }
+            return variants.ifEmpty { listOf(Video(localManifestUrl, "Auto $audioLabel", localManifestUrl, headers = headers, subtitleTracks = subtitleTracks)) }
         } catch (_: Exception) { emptyList() }
     }
 
@@ -574,8 +601,11 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
         val audioLabel = if (audio == "dub") "Dub" else "Sub"
         val qualityOrder = listOf("1080p", "720p", "480p", "360p")
         return videos.sortedWith(
-            compareByDescending<Video> { it.quality.startsWith(audioLabel, ignoreCase = true) }
+            // Sort by audio type first (quality strings now include "Sub"/"Dub" label)
+            compareByDescending<Video> { it.quality.contains(audioLabel, ignoreCase = true) }
+                // Then by preferred quality resolution
                 .thenByDescending { it.quality.contains(quality, ignoreCase = true) }
+                // Then by resolution order (1080p first)
                 .thenBy { video ->
                     val index = qualityOrder.indexOfFirst { video.quality.contains(it) }
                     if (index == -1) qualityOrder.size else index
@@ -584,6 +614,23 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
     }
 
     override fun List<Video>.sort(): List<Video> = sortVideos(this)
+
+    /**
+     * Set a field on SEpisode via reflection. lib v14's SEpisode doesn't have
+     * thumbnail_url/preview_url setters, but AniZen's runtime (v16) does.
+     * Silently no-ops if the setter doesn't exist.
+     */
+    private fun setEpisodeField(episode: SEpisode, fieldName: String, value: String) {
+        try {
+            val setter = episode.javaClass.getMethod(
+                "set${fieldName.replaceFirstChar { it.uppercase() }}",
+                String::class.java,
+            )
+            setter.invoke(episode, value)
+        } catch (_: NoSuchMethodException) {
+        } catch (_: Exception) {
+        }
+    }
 
     // ============================== Settings ==============================
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
