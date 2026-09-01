@@ -75,6 +75,7 @@ def main():
     parser.add_argument("--apk-dir", required=True, help="directory containing the built APKs (recursively)")
     parser.add_argument("--extensions-repo", required=True, help="checked-out clone of arasif10/anime-extensions")
     parser.add_argument("--icons-dir", default=None, help="optional dir with <suffix>.png icons, synced to icon/<pkg>.png")
+    parser.add_argument("--only", default=None, help="comma-separated list of extension suffixes to publish (others are skipped)")
     parser.add_argument("--dry-run", action="store_true", help="update files locally but do not commit or push")
     args = parser.parse_args()
 
@@ -84,6 +85,9 @@ def main():
         sys.exit(f"error: {repo} does not look like the extensions repo (no index.min.json)")
 
     apks = find_apks(apk_dir)
+    if args.only:
+        wanted = {s.strip() for s in args.only.split(",") if s.strip()}
+        apks = {s: v for s, v in apks.items() if s.split(".")[-1] in wanted}
     if not apks:
         sys.exit("error: no extension release APKs found in " + str(apk_dir))
 
