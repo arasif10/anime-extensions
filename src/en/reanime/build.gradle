@@ -1,0 +1,13 @@
+ext {
+    extName = 'ReAnime'
+    extLabel = 'ReAnime (𝕬𝕽)'
+    extClass = '.ReAnime'
+    extVersionCode = 01
+    isNsfw = false
+}
+
+apply from: "$rootDir/common.gradle"
+
+dependencies {
+    implementation("org.nanohttpd:nanohttpd:2.3.1")
+}
