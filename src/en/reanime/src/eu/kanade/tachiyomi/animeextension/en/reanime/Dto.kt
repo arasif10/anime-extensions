@@ -88,6 +88,7 @@ class EpisodeDto(
     @SerialName("title_japanese") val titleJapanese: String? = null,
     @SerialName("title_romanji") val titleRomanji: String? = null,
     val aired: String? = null,
+    val description: String? = null,
     val thumbnail: String? = null,
     @SerialName("is_filler") val isFiller: Boolean = false,
     @SerialName("is_recap") val isRecap: Boolean = false,

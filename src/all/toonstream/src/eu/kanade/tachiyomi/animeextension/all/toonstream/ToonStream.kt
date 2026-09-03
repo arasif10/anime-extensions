@@ -272,7 +272,9 @@ class ToonStream : ConfigurableAnimeSource, AnimeHttpSource() {
         // that can't be found fall back to "unknown" (0) instead of a fake
         // "just now" timestamp.
         val seriesTitle = document.selectFirst("h1.entry-title")?.text()?.trim().orEmpty()
-        val airDates = resolveEpisodeDates(seriesTitle, all.maxOfOrNull { it.season } ?: 1)
+        // TMDB gives real air dates plus, when available, the episode's still
+        // frame and synopsis — surface all three on the episode.
+        val episodeMeta = resolveEpisodeMeta(seriesTitle, all.maxOfOrNull { it.season } ?: 1)
 
         // Newest episode first: latest season on top, highest episode within it.
         return all
@@ -291,7 +293,16 @@ class ToonStream : ConfigurableAnimeSource, AnimeHttpSource() {
                     // season makes the app report thousands of "missing"
                     // episodes between season boundaries.
                     episode_number = info.num.toFloat()
-                    date_upload = airDates[Pair(info.season, info.num)] ?: 0L
+                    val meta = episodeMeta[Pair(info.season, info.num)]
+                    date_upload = meta?.date ?: 0L
+                    // AniZen's runtime SEpisode exposes these via preview_url /
+                    // summary (no episode-level thumbnail_url field exists).
+                    meta?.still?.takeIf { it.isNotBlank() }?.let {
+                        setEpisodeField(this, "preview_url", it)
+                    }
+                    meta?.overview?.takeIf { it.isNotBlank() }?.let {
+                        setEpisodeField(this, "summary", it)
+                    }
                 }
             }
     }
@@ -302,8 +313,25 @@ class ToonStream : ConfigurableAnimeSource, AnimeHttpSource() {
     // is found by title search and each season's episodes are fetched once;
     // results are cached per series for the session.
     private val tmdbShowCache = mutableMapOf<String, Long>() // title(lower) -> tv id
-    private val tmdbDatesCache = mutableMapOf<String, Map<Pair<Int, Int>, Long>>() // title(lower) -> (season, num) -> millis
+    private class TmdbEpisodeMeta(val date: Long, val still: String?, val overview: String?)
+    private val tmdbEpisodeCache = mutableMapOf<String, Map<Pair<Int, Int>, TmdbEpisodeMeta>>() // title(lower) -> (season, num) -> meta
     private val tmdbPopularityCache = mutableMapOf<String, Double>() // title(lower) -> popularity
+
+    /**
+     * Sets a field on SEpisode that exists in AniZen's runtime (preview_url,
+     * summary) but not in the lib-14 stub this extension compiles against.
+     */
+    private fun setEpisodeField(episode: SEpisode, fieldName: String, value: String) {
+        try {
+            val setter = episode.javaClass.getMethod(
+                "set${fieldName.replaceFirstChar { it.uppercase() }}",
+                String::class.java,
+            )
+            setter.invoke(episode, value)
+        } catch (_: NoSuchMethodException) {
+        } catch (_: Exception) {
+        }
+    }
 
     private fun tmdbApiKey(): String =
         preferences.getString(PREF_TMDB_KEY, TMDB_API_KEY_DEFAULT).orEmpty().trim()
@@ -339,12 +367,12 @@ class ToonStream : ConfigurableAnimeSource, AnimeHttpSource() {
         return pop
     }
 
-    private fun resolveEpisodeDates(title: String, maxSeason: Int): Map<Pair<Int, Int>, Long> {
+    private fun resolveEpisodeMeta(title: String, maxSeason: Int): Map<Pair<Int, Int>, TmdbEpisodeMeta> {
         val cacheKey = title.lowercase()
-        tmdbDatesCache[cacheKey]?.let { return it }
-        val dates = mutableMapOf<Pair<Int, Int>, Long>()
+        tmdbEpisodeCache[cacheKey]?.let { return it }
+        val metaMap = mutableMapOf<Pair<Int, Int>, TmdbEpisodeMeta>()
         val apiKey = tmdbApiKey()
-        if (apiKey.isEmpty() || title.isBlank()) return dates
+        if (apiKey.isEmpty() || title.isBlank()) return metaMap
 
         val tvId = runCatching {
             tmdbShowCache.getOrPut(cacheKey) {
@@ -366,7 +394,7 @@ class ToonStream : ConfigurableAnimeSource, AnimeHttpSource() {
                 if (best != 0L) best else first
             }
         }.getOrDefault(0L)
-        if (tvId <= 0L) return dates
+        if (tvId <= 0L) return metaMap
 
         for (season in 1..maxSeason) {
             runCatching {
@@ -377,19 +405,28 @@ class ToonStream : ConfigurableAnimeSource, AnimeHttpSource() {
                 for (i in 0 until episodes.length()) {
                     val ep = episodes.getJSONObject(i)
                     val num = ep.optInt("episode_number", -1)
+                    if (num <= 0) continue
                     val air = ep.optString("air_date")
-                    if (num <= 0 || air.isBlank()) continue
-                    val millis = runCatching {
+                    val millis = if (air.isBlank()) {
+                        0L
+                    } else runCatching {
                         SimpleDateFormat("yyyy-MM-dd", Locale.US)
                             .apply { timeZone = TimeZone.getTimeZone("UTC") }
                             .parse(air)!!.time
                     }.getOrDefault(0L)
-                    if (millis > 0L) dates[Pair(season, num)] = millis
+                    val stillPath = ep.optString("still_path")
+                    val still = stillPath.takeIf { it.isNotBlank() }
+                        ?.let { "https://image.tmdb.org/t/p/w342$it" }
+                    val overview = ep.optString("overview").takeIf { it.isNotBlank() }
+                    // Skip entries that have no air date, still frame or
+                    // synopsis at all (nothing useful to attach).
+                    if (millis <= 0L && still == null && overview == null) continue
+                    metaMap[Pair(season, num)] = TmdbEpisodeMeta(millis, still, overview)
                 }
             }
         }
-        tmdbDatesCache[cacheKey] = dates
-        return dates
+        tmdbEpisodeCache[cacheKey] = metaMap
+        return metaMap
     }
 
     // ============================== Video Streams ==============================

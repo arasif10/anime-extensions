@@ -378,10 +378,17 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
                     else -> null
                 }
                 date_upload = try { dateFormat.parse(ep.aired ?: "")?.time ?: 0L } catch (_: Exception) { 0L }
-                // Set episode thumbnail via reflection — lib v14 SEpisode doesn't
-                // have thumbnail_url but AniZen's runtime does (v16 setter).
+                // Set the episode preview/thumbnail via reflection — lib v14's SEpisode
+                // has no preview_url property, but AniZen's runtime (v16+) does
+                // (setPreview_url on SEpisodeImpl). The API's per-episode thumbnail
+                // image is what the app renders for episode thumbnails/previews.
                 ep.thumbnail?.takeIf { it.isNotBlank() }?.let {
-                    setEpisodeField(this, "thumbnail_url", it)
+                    setEpisodeField(this, "preview_url", it)
+                }
+                // The API exposes a per-episode synopsis (often empty for older
+                // seasons); surface it when present.
+                ep.description?.takeIf { it.isNotBlank() }?.let {
+                    setEpisodeField(this, "summary", it)
                 }
             }
         }.reversed()

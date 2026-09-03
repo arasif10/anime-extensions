@@ -2,7 +2,7 @@ ext {
     extName = 'MovieBox'
     extLabel = 'MovieBox (𝕬𝕽)'
     extClass = '.MovieBox'
-    extVersionCode = 22
+    extVersionCode = 23
     isNsfw = false
 }
 

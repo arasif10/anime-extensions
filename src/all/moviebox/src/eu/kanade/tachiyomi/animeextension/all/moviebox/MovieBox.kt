@@ -532,6 +532,16 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
                         url = "$seNum|$epNum|$idsString|$detailPath" + if (!token.isNullOrBlank()) "|$token" else ""
                         val date = parseDate(metaEp?.released)
                         date_upload = if (date > 0L) date else System.currentTimeMillis()
+                        // Real episode artwork + synopsis from Cinemeta when the
+                        // metadata lookup found the title. AniZen's runtime
+                        // SEpisode exposes these via preview_url/summary (there
+                        // is no episode-level thumbnail_url field).
+                        metaEp?.thumbnail?.takeIf { it.isNotBlank() }?.let {
+                            setEpisodeField(this, "preview_url", it)
+                        }
+                        metaEp?.overview?.takeIf { it.isNotBlank() }?.let {
+                            setEpisodeField(this, "summary", it)
+                        }
                     },
                 )
             }
@@ -635,6 +645,22 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
         val thumbnail: String?,
         val released: String?,
     )
+
+    /**
+     * Sets a field on SEpisode that exists in AniZen's runtime (preview_url,
+     * summary) but not in the lib-14 stub this extension compiles against.
+     */
+    private fun setEpisodeField(episode: SEpisode, fieldName: String, value: String) {
+        try {
+            val setter = episode.javaClass.getMethod(
+                "set${fieldName.replaceFirstChar { it.uppercase() }}",
+                String::class.java,
+            )
+            setter.invoke(episode, value)
+        } catch (_: NoSuchMethodException) {
+        } catch (_: Exception) {
+        }
+    }
 
     override fun videoListRequest(episode: SEpisode): Request = GET(baseUrl, headersBuilder().add("X-Tachiyomi-Episode-Url", episode.url).build())
 
