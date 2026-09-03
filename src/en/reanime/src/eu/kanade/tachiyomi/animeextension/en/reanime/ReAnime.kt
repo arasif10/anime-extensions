@@ -55,7 +55,7 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
     private val apiUrl: String
         get() = "$baseUrl/api/v1"
 
-    private val flixUrl = "$baseUrl/api/flix"
+    private val flixUrl by lazy { "$baseUrl/api/flix" }
 
     private val json: Json by injectLazy()
 
