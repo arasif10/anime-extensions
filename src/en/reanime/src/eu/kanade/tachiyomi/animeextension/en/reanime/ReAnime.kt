@@ -443,10 +443,10 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
             runCatching { extractFromServer(dataLink, audioType) }.getOrDefault(emptyList())
         }.flatten()
 
-        return sortVideos(videos)
+        return videos
     }
 
-    private fun extractFromServer(dataLink: String, audioType: String): List<Video> {
+    private fun decryptFlixCloudStream(dataLink: String, audioType: String): Pair<String, List<Track>>? {
         val flixHeaders = headers.newBuilder()
             .add("Accept", "*/*")
             .add("Origin", flixCloudUrl)
@@ -456,83 +456,88 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
             .add("Accept", "*/*")
             .build()
 
-        return try {
-            // Step 1: Fetch embed page; has XOR key
-            val html = client.newCall(GET(dataLink, flixHeaders)).execute().use { it.body.string() }
-            val hardcodedFallback = listOf(
-                157, 42, 241, 71, 179, 142, 92, 112,
-                166, 25, 228, 59, 216, 98, 15, 197,
-            ).map { it.toByte() }.toByteArray()
-            var xorMask: ByteArray? = null
-            val scriptPath = HLS_SCRIPT_REGEX.find(html)?.groupValues?.get(1)
-            if (scriptPath != null) {
-                val scriptUrl = if (scriptPath.startsWith("http")) scriptPath else "$flixCloudUrl$scriptPath"
-                try {
-                    val jsContent = client.newCall(GET(scriptUrl, flixHeaders)).execute().use { it.body.string() }
-                    xorMask = XOR_MASK_REGEX.find(jsContent)?.groupValues?.get(1)
-                        ?.split(",")?.map { it.trim().toInt().toByte() }?.toByteArray()
-                } catch (_: Exception) {}
+        // Step 1: Fetch embed page; extract XOR key
+        val html = client.newCall(GET(dataLink, flixHeaders)).execute().use { it.body.string() }
+        val hardcodedFallback = listOf(
+            157, 42, 241, 71, 179, 142, 92, 112,
+            166, 25, 228, 59, 216, 98, 15, 197,
+        ).map { it.toByte() }.toByteArray()
+        var xorMask: ByteArray? = null
+        val scriptPath = HLS_SCRIPT_REGEX.find(html)?.groupValues?.get(1)
+        if (scriptPath != null) {
+            val scriptUrl = if (scriptPath.startsWith("http")) scriptPath else "$flixCloudUrl$scriptPath"
+            try {
+                val jsContent = client.newCall(GET(scriptUrl, flixHeaders)).execute().use { it.body.string() }
+                xorMask = XOR_MASK_REGEX.find(jsContent)?.groupValues?.get(1)
+                    ?.split(",")?.map { it.trim().toInt().toByte() }?.toByteArray()
+            } catch (_: Exception) {}
+        }
+        if (xorMask != null) {
+            saveXorMask(xorMask)
+        } else xorMask = loadSavedXorMask() ?: hardcodedFallback
+
+        val server = getProxyServer(headers, xorMask)
+        val dataMatch = EMBED_DATA_REGEX.find(html) ?: return null
+        val rawJson = json5ToJson(dataMatch.groupValues[1])
+
+        val embedDataDto = try { jsonParser.decodeFromString<FlixcloudEmbedDataDto>(rawJson) } catch (_: Exception) { FlixcloudEmbedDataDto() }
+        val subtitleTracks = embedDataDto.subtitles?.mapNotNull { sub ->
+            val subUrl = sub.url ?: return@mapNotNull null
+            Track(server.createSubtitleUrl(subUrl), sub.language ?: "Unknown")
+        } ?: emptyList()
+
+        // Strip subtitles for enc-dec
+        val embedData = try {
+            val obj = jsonParser.parseToJsonElement(rawJson).jsonObject.toMutableMap()
+            obj.remove("subtitles")
+            JsonObject(obj).toString()
+        } catch (_: Exception) { rawJson }
+
+        // Step 2: Get Token
+        val tokenPayload = """{"data":$embedData}"""
+        val tokenDto = client.newCall(
+            Request.Builder()
+                .url("$decApi/dec-flixcloud?type=token")
+                .post(tokenPayload.toRequestBody("application/json".toMediaType()))
+                .headers(decHeaders).build(),
+        ).execute().use { jsonParser.decodeFromString<DecFlixCloudTokenResponseDto>(it.body.string()) }
+        if (tokenDto.status != 200 || tokenDto.result == null) return null
+
+        // Step 3: Fetch encrypted stream
+        val m3u8Body = client.newCall(
+            GET("$flixCloudUrl/api/m3u8/${tokenDto.result.token}", flixHeaders),
+        ).execute().use { it.body.string() }
+        val m3u8JsonElement = try { jsonParser.parseToJsonElement(m3u8Body) } catch (_: Exception) { return null }
+
+        // Step 4: Decrypt Stream
+        val streamPayload = buildJsonObject {
+            putJsonObject("data") {
+                put("context", tokenDto.result.context)
+                put("stream_response", m3u8JsonElement.jsonObject)
             }
-            if (xorMask != null) {
-                saveXorMask(xorMask)
-            } else xorMask = loadSavedXorMask() ?: hardcodedFallback
+        }.toString()
+        val streamDto = client.newCall(
+            Request.Builder()
+                .url("$decApi/dec-flixcloud?type=stream")
+                .post(streamPayload.toRequestBody("application/json".toMediaType()))
+                .headers(decHeaders).build(),
+        ).execute().use { jsonParser.decodeFromString<DecFlixCloudStreamResponseDto>(it.body.string()) }
+        if (streamDto.status != 200 || streamDto.result == null) return null
 
-            val server = getProxyServer(headers, xorMask)
-            val dataMatch = EMBED_DATA_REGEX.find(html) ?: return emptyList()
-            val rawJson = json5ToJson(dataMatch.groupValues[1])
+        val streamUrl = streamDto.result.stream
+        val wPayload = streamDto.result.context["w_payload"]?.jsonPrimitive?.content ?: return null
 
-            val embedDataDto = try { jsonParser.decodeFromString<FlixcloudEmbedDataDto>(rawJson) } catch (_: Exception) { FlixcloudEmbedDataDto() }
-            val subtitleTracks = embedDataDto.subtitles?.mapNotNull { sub ->
-                val subUrl = sub.url ?: return@mapNotNull null
-                Track(server.createSubtitleUrl(subUrl), sub.language ?: "Unknown")
-            } ?: emptyList()
+        // Step 5: Build local proxy URL
+        val localManifestUrl = server.createProxyUrl(streamUrl, wPayload)
+        return localManifestUrl to subtitleTracks
+    }
 
-            // Strip subtitles/chapters for enc-dec
-            val embedData = try {
-                val obj = jsonParser.parseToJsonElement(rawJson).jsonObject.toMutableMap()
-                obj.remove("subtitles"); obj.remove("intro_chapter"); obj.remove("outro_chapter")
-                JsonObject(obj).toString()
-            } catch (_: Exception) { rawJson }
-
-            // Step 2: Get Token
-            val tokenPayload = """{"data":$embedData}"""
-            val tokenDto = client.newCall(
-                Request.Builder()
-                    .url("$decApi/dec-flixcloud?type=token")
-                    .post(tokenPayload.toRequestBody("application/json".toMediaType()))
-                    .headers(decHeaders).build(),
-            ).execute().use { jsonParser.decodeFromString<DecFlixCloudTokenResponseDto>(it.body.string()) }
-            if (tokenDto.status != 200 || tokenDto.result == null) return emptyList()
-
-            // Step 3: Fetch encrypted stream
-            val m3u8Body = client.newCall(
-                GET("$flixCloudUrl/api/m3u8/${tokenDto.result.token}", flixHeaders),
-            ).execute().use { it.body.string() }
-            val m3u8JsonElement = try { jsonParser.parseToJsonElement(m3u8Body) } catch (_: Exception) { return emptyList() }
-
-            // Step 4: Decrypt Stream
-            val streamPayload = buildJsonObject {
-                putJsonObject("data") {
-                    put("context", tokenDto.result.context)
-                    put("stream_response", m3u8JsonElement.jsonObject)
-                }
-            }.toString()
-            val streamDto = client.newCall(
-                Request.Builder()
-                    .url("$decApi/dec-flixcloud?type=stream")
-                    .post(streamPayload.toRequestBody("application/json".toMediaType()))
-                    .headers(decHeaders).build(),
-            ).execute().use { jsonParser.decodeFromString<DecFlixCloudStreamResponseDto>(it.body.string()) }
-            if (streamDto.status != 200 || streamDto.result == null) return emptyList()
-
-            val streamUrl = streamDto.result.stream
-            val wPayload = streamDto.result.context["w_payload"]?.jsonPrimitive?.content ?: return emptyList()
-
-            // Step 5: Build local proxy URL and extract HLS qualities
-            val localManifestUrl = server.createProxyUrl(streamUrl, wPayload)
-            // Fetch the proxied master playlist and extract variants directly
-            val masterText = client.newCall(GET(localManifestUrl, headers)).execute().use { it.body.string() }
+    private fun extractFromServer(dataLink: String, audioType: String): List<Video> {
+        return try {
+            val (localManifestUrl, subtitleTracks) = decryptFlixCloudStream(dataLink, audioType)
+                ?: return emptyList()
             val audioLabel = if (audioType.equals("dub", true)) "Dub" else "Sub"
+            val masterText = client.newCall(GET(localManifestUrl, headers)).execute().use { it.body.string() }
             val variants = STREAM_INF_REGEX.findAll(masterText).mapNotNull { match ->
                 val attributes = match.groupValues[1]
                 match.groupValues[2].trim().takeIf { it.isNotBlank() && !it.startsWith("#") } ?: return@mapNotNull null
@@ -546,7 +551,7 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
                     subtitleTracks = subtitleTracks,
                 )
             }.toList()
-            return variants.ifEmpty { listOf(Video(localManifestUrl, "Auto $audioLabel", localManifestUrl, headers = headers, subtitleTracks = subtitleTracks)) }
+            variants.ifEmpty { listOf(Video(localManifestUrl, "Auto $audioLabel", localManifestUrl, headers = headers, subtitleTracks = subtitleTracks)) }
         } catch (_: Exception) { emptyList() }
     }
 
@@ -595,7 +600,7 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
         preferences.edit().putString("flixcloud_xor_mask", maskStr).apply()
     }
 
-    fun sortVideos(videos: List<Video>): List<Video> {
+    private fun sortVideos(videos: List<Video>): List<Video> {
         val quality = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT) ?: PREF_QUALITY_DEFAULT
         val audio = preferences.getString(PREF_AUDIO_KEY, PREF_AUDIO_DEFAULT) ?: PREF_AUDIO_DEFAULT
         val audioLabel = if (audio == "dub") "Dub" else "Sub"

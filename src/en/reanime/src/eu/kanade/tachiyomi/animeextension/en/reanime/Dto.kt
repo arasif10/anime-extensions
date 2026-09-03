@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.animeextension.en.reanime
 
-import android.util.LruCache
 import eu.kanade.tachiyomi.animeextension.en.reanime.ReAnime.Companion.parseStatus
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import kotlinx.serialization.SerialName
@@ -107,7 +106,6 @@ class VideoServerDto(
     val serverName: String? = null,
     val dataLink: String? = null,
     val dataType: String? = null,
-    val softsub: Boolean = false,
 )
 
 // ======================== Anime Detail DTOs ========================
@@ -166,7 +164,6 @@ class AnimeDetailDto(
     @SerialName("average_score") val averageScore: Int? = null,
     val rating: String? = null,
     private val studios: List<StudioDto>? = null,
-    val relations: List<RelationDto>? = null,
     val synonyms: List<String>? = null,
     val trailer: TrailerDto? = null,
     @SerialName("external_links") val externalLinks: List<ExternalLinkDto>? = null,
@@ -213,56 +210,7 @@ class ExternalLinkDto(
     val type: String? = null,
 )
 
-@Serializable
-class RelationDto(
-    @SerialName("anime_id") val animeId: String,
-    val title: TitleDto? = null,
-    @SerialName("cover_image") val coverImage: CoverDto? = null,
-    val format: String? = null,
-    val season: String? = null,
-    @SerialName("season_year") val seasonYear: Int? = null,
-)
-
-// ======================== Recommendations DTOs ========================
-
-@Serializable
-class RecommendationsDto(
-    val recommendations: List<RecommendationDto>? = null,
-    val success: Boolean? = null,
-)
-
-@Serializable
-class RecommendationDto(
-    val id: String,
-    val title: RecTitleDto,
-    @SerialName("cover_image") val coverImage: CoverDto? = null,
-    val status: String? = null,
-    val genres: List<String>? = null,
-)
-
-@Serializable
-class RecTitleDto(
-    private val english: String? = null,
-    private val romaji: String? = null,
-) {
-    fun preferredTitle(language: String): String? {
-        val preferred = when (language) {
-            "english" -> english
-            "romaji" -> romaji
-            else -> null
-        }?.takeIf(String::isNotBlank)
-
-        return preferred ?: listOfNotNull(romaji, english).firstOrNull(String::isNotBlank)
-    }
-}
-
 // ======================== FlixCloud Embed Data DTOs ========================
-
-@Serializable
-class FlixcloudChapterDto(
-    val start: Long? = null,
-    val end: Long? = null,
-)
 
 @Serializable
 class FlixcloudSubtitleDto(
@@ -273,24 +221,6 @@ class FlixcloudSubtitleDto(
 @Serializable
 class FlixcloudEmbedDataDto(
     val subtitles: List<FlixcloudSubtitleDto>? = null,
-    @SerialName("intro_chapter") private val introChapter: FlixcloudChapterDto? = null,
-    @SerialName("outro_chapter") private val outroChapter: FlixcloudChapterDto? = null,
-) {
-    fun toSkipTimes(): SkipTimes = SkipTimes(
-        introStart = introChapter?.start,
-        introEnd = introChapter?.end,
-        outroStart = outroChapter?.start,
-        outroEnd = outroChapter?.end,
-    )
-}
-
-val skipTimesCache by lazy { LruCache<String, SkipTimes>(64) }
-
-class SkipTimes(
-    val introStart: Long? = null,
-    val introEnd: Long? = null,
-    val outroStart: Long? = null,
-    val outroEnd: Long? = null,
 )
 
 // ======================== FlixCloud Decryption DTOs ========================
