@@ -411,12 +411,15 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
     }
 
     override fun videoListParse(response: Response): List<Video> {
+        val t0 = System.currentTimeMillis()
+        android.util.Log.i("ReAnimeDbg", "videoListParse start")
         // Extract slug and ep number from the watch URL we requested
         val requestUrl = response.request.url.toString()
         val slug = requestUrl.substringAfter("/watch/").substringBefore("?")
         val epNumber = requestUrl.substringAfter("ep=").substringBefore("&").ifBlank { "1" }
 
         val meta = animeMetaCache.get(slug) ?: fetchAnimeMeta(slug)
+        android.util.Log.i("ReAnimeDbg", "meta done ${System.currentTimeMillis() - t0}ms anilist=${meta?.anilistId}")
         if (meta == null || meta.anilistId <= 0) return emptyList()
 
         val referer = "$baseUrl/watch/$slug?ep=$epNumber"
@@ -428,32 +431,44 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
             if (!it.isSuccessful) return emptyList()
             jsonParser.decodeFromString<VideoResponseDto>(it.body.string())
         }
+        android.util.Log.i("ReAnimeDbg", "flix api done ${System.currentTimeMillis() - t0}ms")
         if (parsed.success != true || parsed.servers.isNullOrEmpty()) return emptyList()
-
-        // Dedup by dataLink + dataType so both sub and dub servers survive.
-        // The API returns separate server entries for sub/dub with the same
-        // dataLink — deduping by dataLink alone would silently drop dub.
-        val targetServers = parsed.servers.distinctBy { "${it.dataLink}-${it.dataType}" }
 
         // Apply preferredServer filter if set (e.g. only use HD-1 servers)
         val serverPref = preferredServer.takeIf { it.isNotBlank() }
         val filteredServers = if (serverPref != null) {
-            val matched = targetServers.filter { it.serverName?.equals(serverPref, true) == true }
-            if (matched.isNotEmpty()) matched else targetServers
+            val matched = parsed.servers.filter { it.serverName?.equals(serverPref, true) == true }
+            if (matched.isNotEmpty()) matched else parsed.servers
         } else {
-            targetServers
+            parsed.servers
         }
+        android.util.Log.i("ReAnimeDbg", "servers=${parsed.servers.size} filtered=${filteredServers.size} pref=$serverPref groups=${filteredServers.groupBy { it.dataLink }.size}")
 
-        val videos = filteredServers.mapNotNull { server ->
-            val dataLink = server.dataLink ?: return@mapNotNull null
-            val audioType = server.dataType ?: "sub"
-            runCatching { extractFromServer(dataLink, audioType) }.getOrDefault(emptyList())
-        }.flatten()
+        // Sub and dub entries for the same mirror share one dataLink (same embed
+        // page, same encrypted master). The decrypt pipeline costs several
+        // sequential HTTPS round trips, so group by dataLink and decrypt each
+        // unique link ONCE, then emit one video per audio type so both Sub and
+        // Dub survive without duplicate work. Previously this ran the full
+        // pipeline once per sub/dub/mirror entry (up to 4x) which left the
+        // player on a black screen for ~60s before a single video appeared.
+        var linkN = 0
+        val videos = filteredServers.groupBy { it.dataLink }
+            .mapNotNull { (dataLink, servers) ->
+                val link = dataLink ?: return@mapNotNull null
+                val audioTypes = servers.mapNotNull { it.dataType }.distinct().ifEmpty { listOf("sub") }
+                linkN++
+                val tl = System.currentTimeMillis()
+                val res = runCatching { extractFromServer(link, audioTypes) }.getOrDefault(emptyList())
+                android.util.Log.i("ReAnimeDbg", "link#$linkN done ${System.currentTimeMillis() - tl}ms videos=${res.size}")
+                res
+            }
+            .flatten()
+        android.util.Log.i("ReAnimeDbg", "videoListParse total ${System.currentTimeMillis() - t0}ms videos=${videos.size}")
 
         return videos
     }
 
-    private fun decryptFlixCloudStream(dataLink: String, audioType: String): Pair<String, List<Track>>? {
+    private fun decryptFlixCloudStream(dataLink: String): Pair<String, List<Track>>? {
         val flixHeaders = headers.newBuilder()
             .add("Accept", "*/*")
             .add("Origin", flixCloudUrl)
@@ -539,32 +554,67 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
         return localManifestUrl to subtitleTracks
     }
 
-    private fun extractFromServer(dataLink: String, audioType: String): List<Video> {
+    /**
+     * Decrypt a unique dataLink once, parse its master playlist variants, and
+     * emit one [Video] per (quality, audioType) combination. audioTypes comes
+     * from the flix API server entries that shared this dataLink (sub/dub).
+     */
+    private fun extractFromServer(dataLink: String, audioTypes: List<String>): List<Video> {
         return try {
-            val (localManifestUrl, subtitleTracks) = decryptFlixCloudStream(dataLink, audioType)
+            val (localManifestUrl, subtitleTracks) = decryptFlixCloudStream(dataLink)
                 ?: return emptyList()
-            val audioLabel = if (audioType.equals("dub", true)) "Dub" else "Sub"
             val masterText = client.newCall(GET(localManifestUrl, headers)).execute().use { it.body.string() }
-            val variants = STREAM_INF_REGEX.findAll(masterText).mapNotNull { match ->
+            val qualityLabels = STREAM_INF_REGEX.findAll(masterText).mapNotNull { match ->
                 val attributes = match.groupValues[1]
                 match.groupValues[2].trim().takeIf { it.isNotBlank() && !it.startsWith("#") } ?: return@mapNotNull null
-                val label = attributes.hlsAttr("RESOLUTION")?.substringAfter('x', "")?.let { "${it}p" }
+                attributes.hlsAttr("RESOLUTION")?.substringAfter('x', "")?.let { "${it}p" }
                     ?: attributes.hlsAttr("BANDWIDTH")?.toLongOrNull()?.let { "${it / 1000} kbps" } ?: "Auto"
-                Video(
-                    url = localManifestUrl,
-                    quality = "$label $audioLabel",
-                    videoUrl = localManifestUrl,
-                    headers = headers,
-                    subtitleTracks = subtitleTracks,
-                )
-            }.toList()
-            variants.ifEmpty { listOf(Video(localManifestUrl, "Auto $audioLabel", localManifestUrl, headers = headers, subtitleTracks = subtitleTracks)) }
+            }.toList().ifEmpty { listOf("Auto") }
+
+            // Pre-fetch the master's child playlists (audio + video variants)
+            // and their first segments through the local proxy while we still
+            // hold the parse. mpv then hits the proxy caches instead of paying
+            // ~5-10s of remote decrypt per playlist — this is what turned a
+            // ~50s black screen into a fast start.
+            proxyServer?.warmChildren(childPlaylistUrls(masterText), 15_000)
+
+            qualityLabels.flatMap { quality ->
+                audioTypes.map { audioType ->
+                    val audioLabel = if (audioType.equals("dub", true)) "Dub" else "Sub"
+                    Video(
+                        url = localManifestUrl,
+                        quality = "$quality $audioLabel",
+                        videoUrl = localManifestUrl,
+                        headers = headers,
+                        subtitleTracks = subtitleTracks,
+                    )
+                }
+            }
         } catch (_: Exception) { emptyList() }
     }
 
     private fun String.hlsAttr(name: String): String? =
         Regex("""(?:^|[,:])$name=(?:"([^"]*)"|([^,"]*))""").find(this)
             ?.let { it.groupValues[1].ifEmpty { it.groupValues[2] } }?.takeIf { it.isNotBlank() }
+
+    /**
+     * Pull the child playlist proxy URLs out of a rewritten master playlist:
+     * EXT-X-MEDIA audio-group URIs and the standalone URL lines that follow
+     * each EXT-X-STREAM-INF variant.
+     */
+    private fun childPlaylistUrls(masterText: String): List<String> {
+        val urls = ArrayList<String>()
+        for (line in masterText.split("\n")) {
+            val trimmed = line.trim()
+            when {
+                trimmed.startsWith("#EXT-X-MEDIA") -> {
+                    URI_IN_LINE.find(trimmed)?.let { urls += it.groupValues[1] }
+                }
+                !trimmed.startsWith("#") && trimmed.startsWith("http://127.0.0.1") -> urls += trimmed
+            }
+        }
+        return urls.distinct()
+    }
 
     private fun json5ToJson(json5: String): String = json5
         .replace(JSON5_KEY_REGEX) { "${it.groupValues[1]}\"${it.groupValues[2]}\"${it.groupValues[3]}" }
@@ -726,6 +776,7 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
         private val HLS_SCRIPT_REGEX = Regex("""href="([^"]*hls\.js[^"]*)"""")
         private val XOR_MASK_REGEX = Regex("""for\(var f=\[(\d{1,3}(?:,\d{1,3}){15})]""")
         private val STREAM_INF_REGEX = Regex("""#EXT-X-STREAM-INF:(.+)\r?\n(.+)""")
+        private val URI_IN_LINE = Regex("""URI="([^"]+)"""")
 
         fun parseStatus(status: String?): Int = when (status) {
             "RELEASING", "Releasing" -> SAnime.ONGOING
