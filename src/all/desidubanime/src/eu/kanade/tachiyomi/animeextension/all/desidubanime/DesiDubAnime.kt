@@ -22,8 +22,10 @@ import okhttp3.Request
 import okhttp3.Response
 import org.json.JSONObject
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import kotlin.math.abs
@@ -145,23 +147,60 @@ class DesiDubAnime : AnimeHttpSource() {
     override fun animeDetailsParse(response: Response): SAnime {
         val document = Jsoup.parse(response.body.string(), baseUrl)
         return SAnime.create().apply {
-            title = document.selectFirst("h1")?.text()
-                ?: document.selectFirst("meta[property=og:title]")?.attr("content").orEmpty()
-            thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("abs:content")
-            description = document.selectFirst("section[aria-label=Anime Overview]")?.wholeText()?.trim()
+            // The h1 concatenates both language spans ("Demon Slayer Season 2"
+            // + "Kimetsu no Yaiba: Yuukaku-hen Season 2"), so the clean title
+            // comes from og:title instead.
+            title = document.ogTitle().ifBlank { document.selectFirst("h1")?.text().orEmpty() }
+            // og:image is the site's logo banner; the real poster is
+            // img.anime-main-image (a MAL CDN image).
+            thumbnail_url = document.selectFirst("img.anime-main-image")?.attr("abs:src")
+                ?: document.selectFirst("meta[property=og:image]")?.attr("abs:content")
+            description = document.getElementsByAttributeValue("aria-label", "Anime Overview")
+                .firstOrNull()?.wholeText()?.trim()
                 ?: document.selectFirst("meta[property=og:description]")?.attr("content").orEmpty()
-            genre = document.select("a[href*=/genre/]")
-                .mapNotNull { it.text().takeIf(String::isNotBlank) }
-                .distinct()
-                .joinToString(", ")
-                .takeIf { it.isNotBlank() }
-            val bodyText = document.body().text()
-            status = when {
-                bodyText.contains("Currently Airing", ignoreCase = true) -> SAnime.ONGOING
-                bodyText.contains("Completed", ignoreCase = true) -> SAnime.COMPLETED
-                else -> SAnime.UNKNOWN
-            }
+            // Only the info <dl> (dt/dd rows) may be used for metadata - the
+            // nav mega-menu also contains 60+ /genre/ links that would
+            // otherwise pollute the genre list.
+            author = document.infoValue("Studios")?.text()?.trim()
+                ?.takeIf { it.isNotBlank() && !it.equals("N/A", true) }
+            genre = document.infoValue("Genres")?.select("a")
+                ?.mapNotNull { it.text().trim().takeIf(String::isNotBlank) }
+                ?.distinct()
+                ?.joinToString(", ")
+                ?.takeIf { it.isNotBlank() }
+            status = document.statusFromAired()
         }
+    }
+
+    /** Clean page title from og:title, minus the site-name suffix. */
+    private fun Document.ogTitle(): String = selectFirst("meta[property=og:title]")
+        ?.attr("content")
+        ?.removeSuffix(" - Desi Dub Anime")
+        .orEmpty()
+
+    /** Value <dd> of an info row by its <dt> label ("Studios", "Genres", ...). */
+    private fun Document.infoValue(label: String): Element? =
+        select("dt").firstOrNull { it.text().equals(label, ignoreCase = true) }
+            ?.nextElementSibling()
+
+    /**
+     * Status is never rendered as text on series pages (the old
+     * bodyText.contains("Completed") probe could never match), but the "Aired"
+     * row always is: "Dec 5, 2021 to Feb 13, 2022" with a past end date means
+     * completed, an unparsable or future end means ongoing, no row at all
+     * means unknown.
+     */
+    private fun Document.statusFromAired(): Int {
+        val aired = infoValue("Aired")?.text().orEmpty()
+        if (aired.isBlank()) return SAnime.UNKNOWN
+        val endRaw = if (aired.contains(" to ", ignoreCase = true)) {
+            aired.substringAfterLast("to ").trim()
+        } else {
+            aired
+        }
+        val end = runCatching { SimpleDateFormat("MMM d, yyyy", Locale.US).parse(endRaw) }
+            .getOrNull() ?: return SAnime.ONGOING
+        return if (end.before(Date())) SAnime.COMPLETED else SAnime.ONGOING
     }
 
     // ============================== Episodes ==============================
@@ -220,6 +259,13 @@ class DesiDubAnime : AnimeHttpSource() {
                         episode_number = number.toFloatOrNull() ?: (i + 1).toFloat()
                         scanlator = if (multiSeason) seasonLabel else null
                         date_upload = parseDate(ep.optString("released"))
+                        // Episode still from the site's TMDB-backed payload -
+                        // AniZen's runtime renders it as the row thumbnail via
+                        // preview_url (absent from the lib-14 stub this
+                        // compiles against, hence the reflection helper).
+                        ep.optString("thumbnail").takeIf { it.isNotBlank() }?.let {
+                            setEpisodeField(this, "preview_url", it)
+                        }
                     }
                 }
                 if (page >= data.optInt("max_episodes_page", 1)) break
@@ -244,6 +290,23 @@ class DesiDubAnime : AnimeHttpSource() {
                 .apply { timeZone = TimeZone.getTimeZone("UTC") }
                 .parse(raw.trim())!!.time
         }.getOrDefault(0L)
+    }
+
+    /**
+     * Sets a field on SEpisode that exists in AniZen's runtime (lib v16+)
+     * but not in the lib-14 stub this extension compiles against.
+     * Silently no-ops if the setter doesn't exist.
+     */
+    private fun setEpisodeField(episode: SEpisode, fieldName: String, value: String) {
+        try {
+            val setter = episode.javaClass.getMethod(
+                "set${fieldName.replaceFirstChar { it.uppercase() }}",
+                String::class.java,
+            )
+            setter.invoke(episode, value)
+        } catch (_: NoSuchMethodException) {
+        } catch (_: Exception) {
+        }
     }
 
     // ============================== Video Streams ==============================
@@ -639,19 +702,27 @@ class DesiDubAnime : AnimeHttpSource() {
         val param: String get() = if (state == 1) "ASC" else "DESC"
     }
 
-    private open class ListFilter(
+    // The lib-14 stub's AnimeFilter.CheckBox is abstract, so a concrete
+    // subclass is required (same pattern as the other extensions).
+    private open class CheckBoxVal(name: String, state: Boolean = false) : AnimeFilter.CheckBox(name, state)
+
+    // Multi-select checkbox groups - the site natively accepts repeated
+    // genre[]/status[]/type[]/season[] params, so every checked box is sent
+    // as its own form field.
+    private open class MultiSelectFilter(
         name: String,
         private val field: String,
         values: Array<String>,
-    ) : AnimeFilter.Select<String>(name, values) {
-        fun toParams(): List<Pair<String, String>> = values.getOrNull(state)
-            ?.takeIf { it.isNotBlank() }
-            ?.let { listOf(field to it) }
-            ?: emptyList()
+    ) : AnimeFilter.Group<AnimeFilter.CheckBox>(
+        name,
+        values.map { CheckBoxVal(it) },
+    ) {
+        fun toParams(): List<Pair<String, String>> =
+            state.filter { it.state }.map { field to it.name }
     }
 
-    private class GenreFilter : ListFilter(
-        "Genre",
+    private class GenreFilter : MultiSelectFilter(
+        "Genres",
         "genre[]",
         arrayOf(
             "action", "action-adventure", "adult-cast", "adventure", "animation",
@@ -670,19 +741,19 @@ class DesiDubAnime : AnimeHttpSource() {
         ),
     )
 
-    private class StatusFilter : ListFilter(
+    private class StatusFilter : MultiSelectFilter(
         "Status",
         "status[]",
         arrayOf("airing", "break", "completed", "not-yet-released", "unknown", "upcoming"),
     )
 
-    private class TypeFilter : ListFilter(
+    private class TypeFilter : MultiSelectFilter(
         "Type",
         "type[]",
         arrayOf("movie", "ona", "ova", "tv"),
     )
 
-    private class SeasonFilter : ListFilter(
+    private class SeasonFilter : MultiSelectFilter(
         "Season",
         "season[]",
         arrayOf("winter", "spring", "summer", "fall"),
