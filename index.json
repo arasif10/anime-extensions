@@ -93,5 +93,24 @@
         "baseUrl": "https://reanime.to"
       }
     ]
+  },
+  {
+    "name": "DesiDubAnime",
+    "pkg": "eu.kanade.tachiyomi.animeextension.all.desidubanime",
+    "apk": "aniyomi-all.desidubanime-v14.01-release.apk",
+    "lang": "all",
+    "code": 1,
+    "version": "14.01",
+    "nsfw": 0,
+    "hasReadme": 0,
+    "hasChangelog": 0,
+    "sources": [
+      {
+        "id": 1118365879110,
+        "lang": "all",
+        "name": "DesiDubAnime",
+        "baseUrl": "https://www.desidubanime.me"
+      }
+    ]
   }
 ]
