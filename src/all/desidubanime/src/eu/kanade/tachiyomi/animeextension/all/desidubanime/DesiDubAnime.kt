@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.all.desidubanime
 
 import android.util.Base64
+import android.util.Log
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
@@ -15,6 +16,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.FormBody
 import okhttp3.Headers
@@ -51,6 +53,29 @@ class DesiDubAnime : AnimeHttpSource() {
         .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
         .add("Accept-Language", "en-US,en;q=0.9")
         .add("Referer", "$baseUrl/")
+
+    // ============================== URL helpers ==============================
+    // Entries saved by older versions stored ABSOLUTE urls ("https://...");
+    // newer ones store paths ("/anime/..."). Every request builder funnels
+    // through absoluteUrl() so both keep working, and getAnimeUrl() is
+    // overridden so the app's WebView / related-anime screen never builds
+    // "https://www.desidubanime.mehttps://..." (the NXDOMAIN) links again.
+    private fun absoluteUrl(raw: String): String {
+        val url = raw.trim()
+        return when {
+            url.startsWith("http://") || url.startsWith("https:") -> url
+            url.startsWith("https://") -> url
+            url.startsWith("/") -> baseUrl + url
+            url.isEmpty() -> baseUrl
+            else -> "$baseUrl/$url"
+        }
+    }
+
+    private fun relativeUrl(raw: String): String = raw.trim().removePrefix(baseUrl)
+
+    override fun getAnimeUrl(anime: SAnime): String = absoluteUrl(anime.url)
+
+    override fun getEpisodeUrl(episode: SEpisode): String = absoluteUrl(episode.url)
 
     // ============================== Catalogue ==============================
     // Kiranime theme: every catalogue (popular/latest/search/filters) is one
@@ -137,7 +162,7 @@ class DesiDubAnime : AnimeHttpSource() {
             title = card.selectFirst("h3 a")?.text()
                 ?: card.selectFirst("a.stretched-link")?.attr("title")
                 ?: return@apply
-            url = seriesUrl
+            url = seriesUrl.removePrefix(baseUrl)
             thumbnail_url = card.selectFirst("img")?.attr("abs:src")?.takeIf { it.isNotBlank() }
         }
     }
@@ -155,9 +180,23 @@ class DesiDubAnime : AnimeHttpSource() {
             // img.anime-main-image (a MAL CDN image).
             thumbnail_url = document.selectFirst("img.anime-main-image")?.attr("abs:src")
                 ?: document.selectFirst("meta[property=og:image]")?.attr("abs:content")
-            description = document.getElementsByAttributeValue("aria-label", "Anime Overview")
-                .firstOrNull()?.wholeText()?.trim()
-                ?: document.selectFirst("meta[property=og:description]")?.attr("content").orEmpty()
+            description = buildString {
+                append(
+                    document.getElementsByAttributeValue("aria-label", "Anime Overview")
+                        .firstOrNull()?.wholeText()?.trim()
+                        ?: document.selectFirst("meta[property=og:description]")?.attr("content").orEmpty(),
+                )
+                // The site renders the alt titles as "Native / English /
+                // Synonyms" info rows; the app has no alt-title field, so they
+                // are appended to the description instead.
+                val altNames = listOf("Native", "English", "Synonyms")
+                    .mapNotNull { label -> document.infoValue(label)?.text()?.trim() }
+                    .filter { it.isNotBlank() && !it.equals("N/A", true) }
+                if (altNames.isNotEmpty()) {
+                    append("\n\n")
+                    append(altNames.joinToString(" / "))
+                }
+            }.trim()
             // Only the info <dl> (dt/dd rows) may be used for metadata - the
             // nav mega-menu also contains 60+ /genre/ links that would
             // otherwise pollute the genre list.
@@ -203,15 +242,67 @@ class DesiDubAnime : AnimeHttpSource() {
         return if (end.before(Date())) SAnime.COMPLETED else SAnime.ONGOING
     }
 
+    // ============================== Related anime ===========================
+    // AniZen's extensions-lib 1.6 exposes recommendations through
+    // supportsRelatedAnimes + fetchRelatedAnimeList(); the lib-14 stub this
+    // compiles against doesn't declare those members, so they are plain
+    // declarations with matching JVM signatures - at runtime the app's own
+    // interface dispatches straight onto them (same mechanism as the
+    // preview_url reflection helper below).
+    // The site's series pages lazy-load their "Recommended Section" widget:
+    //   <div data-lazy-load-components-id='<b64 {"id":..,"post_type":"anime"}>'
+    //        data-component-name="recommended">
+    // and fill it from the REST endpoint
+    //   /wp-json/kiranime/v1/widget?name=recommended&id=<id>&post_type=anime&display=grid
+    // which returns {"status":true,"result":"<article.anime-card>..."}.
+    val supportsRelatedAnimes: Boolean = true
+
+    @Suppress("unused")
+    suspend fun fetchRelatedAnimeList(anime: SAnime): List<SAnime> = withContext(Dispatchers.IO) {
+        runCatching {
+            val pageUrl = absoluteUrl(anime.url)
+            val document = Jsoup.parse(
+                client.newCall(GET(pageUrl, headers)).execute().use { it.body.string() },
+                baseUrl,
+            )
+            val payload = document.selectFirst("[data-lazy-load-components-id]")
+                ?.attr("data-lazy-load-components-id").orEmpty()
+            val postId = JSONObject(String(Base64.decode(payload, Base64.DEFAULT)))
+                .optInt("id", -1)
+            if (postId <= 0) return@runCatching emptyList<SAnime>()
+
+            val widgetHeaders = headers.newBuilder()
+                .set("X-Requested-With", "XMLHttpRequest")
+                .set("Referer", pageUrl)
+                .build()
+            val widget = client.newCall(
+                GET(
+                    "$baseUrl/wp-json/kiranime/v1/widget?name=recommended&id=$postId&post_type=anime&display=grid",
+                    widgetHeaders,
+                ),
+            ).execute().use { it.body.string() }
+            val html = JSONObject(widget).optString("result")
+            if (html.isBlank()) return@runCatching emptyList<SAnime>()
+
+            Jsoup.parse(html, baseUrl).select("article.anime-card").mapNotNull(::cardToAnime)
+        }.getOrDefault(emptyList())
+    }
+
     // ============================== Episodes ==============================
     // Episodes live behind a per-season ajax: GET admin-ajax.php
     // ?action=get_episodes&anime_id=<seasonId>&page=N&order=desc (no nonce).
     // Season ids are the data-season attributes of the series page; each
     // episode object carries url, number, title, meta_number and released.
-    override fun episodeListRequest(anime: SAnime): Request = GET(anime.url, headers)
+    override fun episodeListRequest(anime: SAnime): Request = GET(absoluteUrl(anime.url), headers)
 
     override fun episodeListParse(response: Response): List<SEpisode> {
         val document = Jsoup.parse(response.body.string(), baseUrl)
+        // The Kiranime theme renders EVERY season button of the franchise on
+        // each page (the Season 2 page lists S1/S2/S3 buttons), and each
+        // button's id returns its OWN episodes from the get_episodes ajax -
+        // so all seasons are merged and the entry names get a season prefix.
+        // (v14.04 kept only the active bg-accent-2 season, which removed the
+        // season buttons users browse with.)
         val seasons = document.select("button[data-season]")
             .map { it.attr("data-season") to it.text().trim() }
             .filter { it.first.isNotBlank() }
@@ -245,7 +336,7 @@ class DesiDubAnime : AnimeHttpSource() {
                     val label = ep.optString("number").ifBlank { "Episode $number" }
                     val epTitle = ep.optString("title")
                     episodes += SEpisode.create().apply {
-                        url = epUrl
+                        url = relativeUrl(epUrl)
                         // "Episode 5 - The Frontier Lord ..."; a season prefix is
                         // only added when the series actually has several seasons
                         // so that repeated episode numbers stay distinguishable.
@@ -318,7 +409,7 @@ class DesiDubAnime : AnimeHttpSource() {
     //   - vidmoly - a JWPlayer page with a plain sources:[{file: m3u8}] config.
     // Abyssdub (dead DNS) and the p2pplay.pro JS dashboards yield no static
     // stream, so they are skipped before any network call.
-    override fun videoListRequest(episode: SEpisode): Request = GET(episode.url, headers)
+    override fun videoListRequest(episode: SEpisode): Request = GET(absoluteUrl(episode.url), headers)
 
     override fun videoListParse(response: Response): List<Video> {
         val document = Jsoup.parse(response.body.string(), baseUrl)
@@ -337,9 +428,11 @@ class DesiDubAnime : AnimeHttpSource() {
         val perServer: List<List<Video>> = runBlocking {
             servers.map { (label, url) ->
                 async(Dispatchers.IO) {
-                    withTimeoutOrNull(12_000L) {
-                        runCatching { resolveServer(label, url, episodeUrl) }.getOrDefault(emptyList())
-                    }.orEmpty()
+                    withTimeoutOrNull(20_000L) {
+                        runCatching { resolveServer(label, url, episodeUrl) }
+                            .onFailure { Log.w(LOG_TAG, "resolve '$label' threw", it) }
+                            .getOrDefault(emptyList())
+                    }.orEmpty().also { Log.d(LOG_TAG, "server '$label' -> ${it.size} videos") }
                 }
             }.awaitAll()
         }
@@ -354,12 +447,37 @@ class DesiDubAnime : AnimeHttpSource() {
             )
     }
 
-    private fun resolveServer(label: String, url: String, episodeUrl: String): List<Video> = when {
-        url.contains("abyssplayer.com") || url.contains("p2pplay.pro") -> emptyList()
-        url.contains("filesforever.link/embed/") ->
-            resolveFilesForever(url.substringAfterLast("/"))
-        url.contains("vidmoly") -> resolveVidmoly(url, episodeUrl, label)
-        else -> extractDirectVideoUrls(tryGet(url, episodeUrl).orEmpty(), url, episodeUrl, label)
+    /**
+     * Servers are published as base64(label):base64(payload). Older pages put a
+     * bare URL in the payload, but newer ones embed an <iframe src='...'>
+     * snippet (or a whole <div> player wrapper) - the real URL has to be pulled
+     * out of the markup first. Otherwise the HTML string is sent as a request
+     * URL, the fetch fails, and the server looks dead (the "No available
+     * videos" episodes whose only live host is encoded this way).
+     */
+    private fun payloadUrl(payload: String): String? {
+        val trimmed = payload.trim()
+        if (trimmed.isEmpty()) return null
+        if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) return trimmed
+        if (trimmed.startsWith("//")) return "https:$trimmed"
+        val candidate = IFRAME_SRC_REGEX.find(trimmed)?.groupValues?.get(1)
+            ?: URL_IN_TEXT_REGEX.find(trimmed)?.value
+            ?: return null
+        return if (candidate.startsWith("//")) "https:$candidate" else candidate
+    }
+
+    private fun resolveServer(label: String, payload: String, episodeUrl: String): List<Video> {
+        val url = payloadUrl(payload) ?: return emptyList()
+        return when {
+            url.contains("abyssplayer.com") || url.contains("p2pplay.pro") -> emptyList()
+            url.contains("filesforever.link/embed/") ->
+                resolveFilesForever(url.substringAfterLast("/"))
+            url.contains("vidmoly") -> resolveVidmoly(url, episodeUrl, label)
+            // Unknown host (rubyvidhub/streamruby, ...): fetch the embed page
+            // and pull any HLS master out of it (packed JWPlayer config or an
+            // inline m3u8), using the embed page itself as the media Referer.
+            else -> extractDirectVideoUrls(tryGet(url, episodeUrl).orEmpty(), url, url, label)
+        }
     }
 
     /**
@@ -522,9 +640,15 @@ class DesiDubAnime : AnimeHttpSource() {
 
     /**
      * Expands an HLS master playlist into one Video per quality variant
-     * (360p/480p/720p/1080p) so the app shows a real quality picker, plus an
-     * "Auto" master entry whose in-player track selector exposes every
-     * quality AND the audio renditions (Hindi/Japanese/English...).
+     * (360p/480p/720p/1080p) so the app shows a real quality picker.
+     *
+     * Multi-audio masters (Hindi/Tamil/Telugu/English/Japanese dubs) get one
+     * entry per (quality x language) with the dub rewritten into the variant
+     * URL - the ONLY reliable way to pick a language, because the master's
+     * single video variant is hard-muxed to one dub, so the player's in-player
+     * AUDIO menu can list every rendition but switching it never changes what
+     * you hear. The master-based "Auto" entry is only served when the
+     * rewrites fail, as a fallback that keeps the list non-empty.
      */
     private fun buildHlsVideos(
         masterUrl: String,
@@ -541,14 +665,73 @@ class DesiDubAnime : AnimeHttpSource() {
         val variants = playlist?.let { parseHlsVariants(it, masterUrl) }.orEmpty()
         val audioTracks = playlist?.let { parseHlsAudio(it, masterUrl) }.orEmpty()
 
-        variants.forEach { (label, url) ->
-            videos += Video(url, "$serverName • $label", url, headers = reqHeaders, subtitleTracks = tracks, audioTracks = audioTracks)
+        // Multi-audio masters (Hindi/Tamil/Telugu/English/Japanese dubs):
+        // each quality variant is hard-muxed to ONE audio rendition
+        // (index-vN-aM.m3u8), so the master's in-player AUDIO menu lists every
+        // rendition but switching it never changes the audible dub. Instead,
+        // ship one entry per (quality x language) with the dub rewritten into
+        // the variant URL; each rewritten URL must answer 200 before it is
+        // listed, and the whole block is failure-proof.
+        val languageVideos = if (audioTracks.size > 1) {
+            runCatching {
+                runBlocking {
+                    variants.flatMap { (label, url) -> audioTracks.map { audio -> Triple(label, url, audio) } }
+                        .map { (label, url, audio) ->
+                            async(Dispatchers.IO) {
+                                val rewritten = rewriteAudioVariant(url, audio.url) ?: return@async null
+                                if (!hlsUrlAlive(rewritten, reqHeaders)) return@async null
+                                Video(
+                                    rewritten,
+                                    "$serverName • $label • ${audio.lang}",
+                                    rewritten,
+                                    headers = reqHeaders,
+                                    subtitleTracks = tracks,
+                                    audioTracks = listOf(audio),
+                                )
+                            }
+                        }
+                        .awaitAll()
+                        .filterNotNull()
+                }
+            }.getOrDefault(emptyList())
+        } else {
+            emptyList()
         }
-        // The adaptive master lets the player switch quality on the fly and
-        // natively exposes the audio languages.
-        videos += Video(masterUrl, "$serverName • Auto", masterUrl, headers = reqHeaders, subtitleTracks = tracks, audioTracks = audioTracks)
+
+        if (languageVideos.isNotEmpty()) {
+            // Working per-language entries replace the master-based ones (no
+            // misleading Auto audio menu). The plain variant entries stay - a
+            // media playlist has one embedded dub, so they declare no audio
+            // tracks instead of a menu that can't switch anything.
+            videos += languageVideos
+            variants.forEach { (label, url) ->
+                videos += Video(url, "$serverName • $label", url, headers = reqHeaders, subtitleTracks = tracks)
+            }
+        } else {
+            // Fallback (also the normal path for single-audio hosts): the
+            // pre-v14.05 entries. Always built so a reachable master can
+            // never end up with an empty video list.
+            variants.forEach { (label, url) ->
+                videos += Video(url, "$serverName • $label", url, headers = reqHeaders, subtitleTracks = tracks, audioTracks = audioTracks)
+            }
+            // The adaptive master lets the player switch quality on the fly
+            // and natively exposes the audio renditions.
+            videos += Video(masterUrl, "$serverName • Auto", masterUrl, headers = reqHeaders, subtitleTracks = tracks, audioTracks = audioTracks)
+        }
         return videos
     }
+
+    /** index-v1-a2.m3u8 + index-a4.m3u8 -> index-v1-a4.m3u8 (audio slot swap). */
+    private fun rewriteAudioVariant(variantUrl: String, audioUrl: String): String? {
+        val slot = AUDIO_SLOT_REGEX.find(variantUrl)?.value ?: return null
+        val audioIndex = AUDIO_INDEX_REGEX.find(audioUrl)?.groupValues?.get(1) ?: return null
+        return variantUrl.replace(slot, "-a$audioIndex.m3u8")
+    }
+
+    /** Cheap liveness probe - the token URLs 404 once expired. */
+    private fun hlsUrlAlive(url: String, headers: Headers): Boolean = runCatching {
+        client.newCall(GET(url, headers)).execute().use { it.isSuccessful }
+    }.getOrDefault(false)
 
     /** Parses #EXT-X-MEDIA:TYPE=AUDIO entries of a master playlist into Tracks. */
     private fun parseHlsAudio(playlist: String, masterUrl: String): List<Track> {
@@ -616,14 +799,19 @@ class DesiDubAnime : AnimeHttpSource() {
      * order; hls4 is usually RELATIVE (/stream/...) and must be resolved
      * against the player page.
      */
-    private fun decodePackedStreamUrl(html: String, pageUrl: String): String? {
+    private fun decodePackedStreamUrl(html: String, pageUrl: String): String? = runCatching {
         var searchFrom = 0
-        while (true) {
+        while (searchFrom < html.length) {
             val start = html.indexOf("eval(function(p,a,c,k,e,d)", searchFrom)
-            if (start == -1) return null
+            if (start == -1) return@runCatching null
             val segment = html.substring(start)
-            val args = Regex("""}\('(.*)',\s*(\d+),\s*(\d+),\s*'(.*)'\.split\('\|'\)""", RegexOption.DOT_MATCHES_ALL)
-                .find(segment) ?: return null
+            // NOTE: no escaped punctuation and no bare braces - Android's ICU
+            // regex rejects a stray '}' (PatternSyntaxException near index 1),
+            // which used to kill every packer-based host at runtime.
+            val args = Regex(
+                """[}][(]'(.*)',\s*(\d+),\s*(\d+),'(.*)'[.]split[(]'[|]'[)]""",
+                RegexOption.DOT_MATCHES_ALL,
+            ).find(segment) ?: return@runCatching null
             val src = args.groupValues[1]
             val radix = args.groupValues[2].toIntOrNull() ?: 10
             val count = args.groupValues[3].toIntOrNull() ?: 0
@@ -635,7 +823,7 @@ class DesiDubAnime : AnimeHttpSource() {
                 }
             }
             // Pattern 1: JWPlayer links object - site order hls4, hls3, hls2, hls.
-            val linksBlock = Regex("""links\s*=\s*\{([^}]*)\}""").find(decoded)
+            val linksBlock = Regex("""links\s*=\s*[{]([^}]*)[}]""").find(decoded)
             if (linksBlock != null) {
                 for (key in listOf("hls4", "hls3", "hls2", "hls")) {
                     val linkMatch = Regex("""["']?$key["']?\s*:\s*["']([^"']+)["']""")
@@ -660,7 +848,8 @@ class DesiDubAnime : AnimeHttpSource() {
             }
             searchFrom = start + 10
         }
-    }
+        null
+    }.getOrNull()
 
     private fun toBase(n: Int, radix: Int): String {
         val digits = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -797,6 +986,16 @@ class DesiDubAnime : AnimeHttpSource() {
         // var kiraConfig = {...,"nonce":{...,"search_actions":"9d6223d1c1"}}.
         private val NONCE_REGEX = Regex(""""search_actions":"([0-9a-f]+)"""")
 
+        // Audio rendition slot inside variant/playlist URLs: index-a2.m3u8 /
+        // index-v1-a2.m3u8 - the number selects which dub the media carries.
+        private val AUDIO_INDEX_REGEX = Regex("-a(\\d+)\\.m3u8")
+        private val AUDIO_SLOT_REGEX = Regex("-a\\d+\\.m3u8")
+
+        // Player URL inside an <iframe src="..."> payload (and any bare URL
+        // found in a markup payload) - see payloadUrl().
+        private val IFRAME_SRC_REGEX = Regex("""(?i)\bsrc\s*=\s*["']([^"']+)["']""")
+        private val URL_IN_TEXT_REGEX = Regex("""https?://[^"'\s<>]+""")
+
         // Series page URL inside a card's Info button onclick handler.
         private val ANIME_URL_REGEX = Regex("""https?://[^'"]+/anime/[^'"]+""")
 
@@ -820,6 +1019,9 @@ class DesiDubAnime : AnimeHttpSource() {
          * kept positive via abs(). ALWAYS call it with versionCode = 1 so the
          * id stays stable across extVersionCode bumps.
          */
+        /** Temporary diagnostics for host-resolution failures (logcat). */
+        private const val LOG_TAG = "DesiDubAnime"
+
         private fun generateId(name: String, lang: String, versionCode: Int): Long =
             abs((name.hashCode().toLong() * 31 + lang.hashCode()) * 31 + versionCode)
     }
