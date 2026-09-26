@@ -97,10 +97,10 @@
   {
     "name": "DesiDubAnime",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.desidubanime",
-    "apk": "aniyomi-all.desidubanime-v14.02-release.apk",
+    "apk": "aniyomi-all.desidubanime-v14.07-release.apk",
     "lang": "all",
-    "code": 2,
-    "version": "14.02",
+    "code": 7,
+    "version": "14.07",
     "nsfw": 0,
     "hasReadme": 0,
     "hasChangelog": 0,
