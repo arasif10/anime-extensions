@@ -115,6 +115,10 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
 
     private var nextLatestCursor: String? = null
 
+    // Genres the user excluded with the TriState genre filter. The API only supports
+    // include-style genre queries, so exclusions are applied to the parsed results.
+    private var excludedGenres: List<String> = emptyList()
+
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
     }
@@ -168,6 +172,8 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
             addQueryParameter("limit", limit.toString())
             addQueryParameter("offset", ((page - 1) * limit).toString())
             if (query.isNotBlank()) addQueryParameter("q", query)
+            excludedGenres = filters.filterIsInstance<Filters.GenreFilter>()
+                .flatMap { it.getExcludedValues() }
             filters.forEach { filter ->
                 when (filter) {
                     is Filters.SortFilter -> addQueryParameter("sort", filter.getValue())
@@ -205,9 +211,18 @@ class ReAnime : ConfigurableAnimeSource, AnimeHttpSource() {
 
     override fun searchAnimeParse(response: Response): AnimesPage {
         val dto = jsonParser.decodeFromString<SearchResponseDto>(response.body.string())
-        val animes = (dto.results ?: emptyList()).mapNotNull { it.toSAnime(titleLanguage) }
+        val animes = (dto.results ?: emptyList())
+            .mapNotNull { it.toSAnime(titleLanguage) }
+            .filter { it.hasNoExcludedGenre() }
         val hasNextPage = ((dto.offset ?: 0) + (dto.limit ?: 0)) < (dto.total ?: 0)
         return AnimesPage(animes, hasNextPage)
+    }
+
+    private fun SAnime.hasNoExcludedGenre(): Boolean {
+        if (excludedGenres.isEmpty()) return true
+        val ownGenres = genre?.split(",")?.map { it.trim().lowercase() }?.filter { it.isNotEmpty() }
+        if (ownGenres.isNullOrEmpty()) return true
+        return excludedGenres.none { excluded -> ownGenres.contains(excluded.lowercase()) }
     }
 
     // =========================== Anime Details ============================

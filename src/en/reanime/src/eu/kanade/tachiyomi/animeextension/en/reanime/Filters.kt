@@ -62,9 +62,20 @@ object Filters {
         }
     }
 
-    class GenreCheckBox(name: String, val value: String) : AnimeFilter.CheckBox(name, false)
+    // TriState so one tap = include, second tap = exclude (same behaviour as Hanime/ReAnime's older builds).
+    class GenreCheckBox(name: String, val value: String) :
+        AnimeFilter.TriState(name, AnimeFilter.TriState.STATE_IGNORE)
+
     class GenreFilter : AnimeFilter.Group<GenreCheckBox>("Genres", GENRES.map { GenreCheckBox(it, it) }) {
-        fun getSelectedValues(): String = state.filter { it.state }.joinToString(",") { it.value }
+        fun getIncludedValues(): List<String> = state
+            .filter { it.state == AnimeFilter.TriState.STATE_INCLUDE }
+            .map { it.value }
+
+        fun getExcludedValues(): List<String> = state
+            .filter { it.state == AnimeFilter.TriState.STATE_EXCLUDE }
+            .map { it.value }
+
+        fun getSelectedValues(): String = getIncludedValues().joinToString(",")
         companion object {
             private val GENRES = listOf(
                 "Action", "Action & Adventure", "Adventure", "Animation", "Avant Garde",
