@@ -78,10 +78,10 @@
   {
     "name": "ReAnime (𝕬𝕽)",
     "pkg": "eu.kanade.tachiyomi.animeextension.en.reanime",
-    "apk": "aniyomi-en.reanime-v14.04-release.apk",
+    "apk": "aniyomi-en.reanime-v14.06-release.apk",
     "lang": "en",
-    "code": 4,
-    "version": "14.04",
+    "code": 6,
+    "version": "14.06",
     "nsfw": 0,
     "hasReadme": 0,
     "hasChangelog": 0,
