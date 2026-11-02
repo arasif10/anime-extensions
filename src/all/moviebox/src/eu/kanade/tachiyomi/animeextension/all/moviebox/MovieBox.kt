@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.SharedPreferences
 import android.net.Uri
 import android.util.Base64
+import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
@@ -71,24 +72,24 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
 
     private val json: Json by lazy { Injekt.get() }
 
+    // Details responses are the only place MovieBox lists every dub track, and
+    // browse pages reuse subjects, so the extra languages are cached.
+    private val dubLanguagesCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+
     private fun saveToken(token: String?) {
         if (!token.isNullOrBlank() && isTokenValid(token)) {
             bearerToken = token
-            preferences.edit().putString("moviebox_bearer_token", token).apply()
         }
     }
 
     private fun getCachedToken(): String {
         synchronized(this) {
             if (isTokenValid(bearerToken)) return bearerToken!!
-            val saved = preferences.getString("moviebox_bearer_token", null)
-            if (isTokenValid(saved)) {
-                bearerToken = saved
-                return saved!!
-            }
 
-            // Any endpoint answers with an "x-user" header carrying a JWT; the
-            // ranking endpoint is cheap so use it to bootstrap a token.
+            // Each app process generates a fresh random device id, and tokens
+            // are bound to it, so a token persisted by an earlier run is always
+            // rejected with 401. Keep the token in memory and bootstrap a new
+            // one per process instead of reusing the stored one.
             val host = getPreferredHost()
             val url = "$host/wefeed-mobile-bff/tab/ranking-list?tabId=0&categoryType=4516404531735022304&page=1&perPage=1"
             val request = GET(url, getApiHeaders(url, forceNoToken = true))
@@ -100,7 +101,6 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
                         val token = tokenRegex.find(xUser)?.groupValues?.get(1)
                         if (!token.isNullOrBlank() && isTokenValid(token)) {
                             bearerToken = token
-                            preferences.edit().putString("moviebox_bearer_token", token).apply()
                             return token
                         }
                     }
@@ -176,12 +176,6 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
         val tsStr = timestamp.toString()
         val hash = tsStr.reversed().md5()
         return "$tsStr,$hash"
-    }
-
-    private val deviceId by lazy {
-        val bytes = ByteArray(16)
-        SecureRandom().nextBytes(bytes)
-        bytes.joinToString("") { "%02x".format(it) }
     }
 
     private fun String.md5(): String = toByteArray().md5()
@@ -450,7 +444,9 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
         val subject = data["subject"]?.obj ?: data
 
         return SAnime.create().apply {
-            title = subject["title"]?.str ?: ""
+            // The list card carries "[English, Hindi]" so the languages are
+            // visible while browsing; inside the entry the title stays clean.
+            title = stripLanguageTags(subject["title"]?.str ?: "")
             description = subject["description"]?.str
             genre = subject["genre"]?.str
             author = subject["countryName"]?.str
@@ -515,13 +511,23 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
 
         val showTitle = data["subject"]?.obj?.get("title")?.str ?: data["title"]?.str ?: ""
         val isTv = seasonsMap.isNotEmpty() && (seasonsMap.keys.size > 1 || (seasonsMap[1]?.size ?: 0) > 1)
+        // Remakes share a title (Avatar exists as the 2005 animated series and
+        // the 2024 live action one), so the release year decides which Cinemeta
+        // entry the episode names and preview images come from.
+        val releaseYear = (data["subject"]?.obj?.get("releaseDate")?.str ?: data["releaseDate"]?.str)
+            ?.let { YEAR_REGEX.find(it)?.value?.toIntOrNull() }
+            ?: YEAR_REGEX.find(showTitle)?.value?.toIntOrNull()
         val (_, metaEps) = if (showTitle.isNotBlank()) {
-            fetchCinemetaMeta(showTitle, isTv)
+            fetchCinemetaMeta(showTitle, isTv, releaseYear)
         } else {
             Pair(null, emptyList())
         }
 
-        val idsString = allIds.joinToString("~~") { "${it.first}:${it.second}" }
+        // The language priority setting decides which audio track comes first;
+        // the sort is stable, so languages it does not mention keep their order.
+        val languagePriority = preferredLanguages()
+        val orderedIds = allIds.sortedBy { languageRank(it.second, languagePriority) }
+        val idsString = orderedIds.joinToString("~~") { "${it.first}:${it.second}" }
         seasonsMap.forEach { (seNum, epSet) ->
             epSet.sorted().forEach { epNum ->
                 val metaEp = metaEps.firstOrNull { it.season == seNum && it.episode == epNum }
@@ -584,7 +590,7 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
         }
     }
 
-    private fun fetchCinemetaMeta(title: String, isTv: Boolean): Pair<String?, List<CinemetaEpisode>> {
+    private fun fetchCinemetaMeta(title: String, isTv: Boolean, year: Int? = null): Pair<String?, List<CinemetaEpisode>> {
         val cleanTitle = title.substringBefore("(").substringBefore("[").trim()
         if (cleanTitle.isBlank()) return Pair(null, emptyList())
         val metaType = if (isTv) "series" else "movie"
@@ -596,14 +602,26 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
                 val body = response.body.string()
                 val jsonRes = json.parseToJsonElement(body).obj ?: return Pair(null, emptyList())
                 val metas = jsonRes["metas"]?.arr ?: return Pair(null, emptyList())
-                var bestImdbId: String? = null
-                for (metaEl in metas) {
-                    val m = metaEl.obj ?: continue
-                    val name = m["name"]?.str ?: continue
-                    if (name.equals(cleanTitle, ignoreCase = true) || name.contains(cleanTitle, ignoreCase = true) || cleanTitle.contains(name, ignoreCase = true)) {
-                        bestImdbId = m["imdb_id"]?.str
-                        if (bestImdbId != null) break
-                    }
+                val matches = metas.mapNotNull { metaEl ->
+                    val m = metaEl.obj ?: return@mapNotNull null
+                    val name = m["name"]?.str ?: return@mapNotNull null
+                    val nameMatches = name.equals(cleanTitle, ignoreCase = true) ||
+                        name.contains(cleanTitle, ignoreCase = true) || cleanTitle.contains(name, ignoreCase = true)
+                    if (!nameMatches) return@mapNotNull null
+                    val id = m["imdb_id"]?.str ?: return@mapNotNull null
+                    id to YEAR_REGEX.find(m["releaseInfo"]?.str.orEmpty())?.value?.toIntOrNull()
+                }
+                // Same year wins, then a release year one off (cinema vs air
+                // date), then a lone candidate. Two same-name shows with no
+                // matching year are ambiguous: no metadata beats wrong art.
+                val bestImdbId = when {
+                    year == null -> matches.firstOrNull()?.first
+                    else -> matches.firstOrNull { it.second == year }?.first
+                        ?: matches.firstOrNull { candidate ->
+                            val releaseYear = candidate.second
+                            releaseYear != null && kotlin.math.abs(releaseYear - year) <= 1
+                        }?.first
+                        ?: matches.singleOrNull()?.first
                 }
 
                 if (bestImdbId != null) {
@@ -711,10 +729,38 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
     private fun sortVideos(videos: List<Video>): List<Video> {
         val quality = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT)!!
         val audio = preferences.getString(PREF_AUDIO_KEY, PREF_AUDIO_DEFAULT)!!
-        return videos.sortedWith(
-            compareByDescending<Video> { it.quality.contains(audio, ignoreCase = true) }
-                .thenByDescending { it.quality.contains(quality, ignoreCase = true) },
-        )
+        val priority = preferredLanguages()
+        // Group by language before sorting: a flat resolution sort would
+        // interleave another language's 1080P between this one's 1080P and
+        // 720P. Each language then runs 1080P, 720P, 480P, ... in its own block.
+        val groups = LinkedHashMap<String, MutableList<Video>>()
+        videos.forEach { video ->
+            groups.getOrPut(audioLanguageOf(video.quality)) { mutableListOf() }.add(video)
+        }
+        return groups.entries
+            .sortedBy { (language, _) -> audioLanguageRank(language, audio, priority) }
+            .flatMap { (_, tracks) ->
+                tracks.sortedWith(
+                    compareByDescending<Video> { it.quality.contains(quality, ignoreCase = true) }
+                        .thenByDescending { resolutionOf(it.quality) },
+                )
+            }
+    }
+
+    private fun audioLanguageOf(label: String): String =
+        label.substringAfterLast("(", "").substringBefore(")", "").trim()
+
+    private fun resolutionOf(label: String): Int = RESOLUTION_REGEX.find(label)?.value?.toIntOrNull() ?: 0
+
+    /** Ranks a language by the language priority, then by the preferred audio setting. */
+    private fun audioLanguageRank(language: String, preferredAudio: String, priority: List<String>): Int {
+        val rank = languageRank(language, priority)
+        if (rank < priority.size) return rank
+        return if (language.isNotEmpty() && language.contains(preferredAudio, ignoreCase = true)) {
+            priority.size
+        } else {
+            priority.size + 1
+        }
     }
 
     private val blockedKeywords = listOf(
@@ -733,16 +779,56 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
 
     private fun parseSubjectListPage(data: JsonObject): AnimesPage {
         val items = data["subjectList"]?.arr ?: data["items"]?.arr ?: data["subjects"]?.arr ?: data["results"]?.arr?.mapNotNull { it.obj?.get("subjects")?.arr }?.flatten() ?: return AnimesPage(emptyList(), false)
-        val animes = items.mapNotNull { item ->
-            val obj = item.obj ?: return@mapNotNull null
+        val priority = preferredLanguages()
+        // MovieBox lists every audio language as its own subject, so searching
+        // "airbender" returns "Avatar: The Last Airbender [Hindi] S1-S2" next to
+        // "Avatar: The Last Airbender S1-S2" with the same poster. Cards are
+        // merged by title, year and season count, and the languages move into
+        // the title so a single card tells the user what is available.
+        val groups = LinkedHashMap<String, MutableList<SubjectCard>>()
+        items.forEach { item ->
+            val obj = item.obj ?: return@forEach
             val subject = obj["subject"]?.obj ?: obj
-            if (!isAllowedSubject(subject)) return@mapNotNull null
-            val id = subject["subjectId"]?.str ?: subject["id"]?.str ?: return@mapNotNull null
+            if (!isAllowedSubject(subject)) return@forEach
+            val id = subject["subjectId"]?.str ?: subject["id"]?.str ?: return@forEach
+            val rawTitle = subject["title"]?.str ?: return@forEach
+            val baseTitle = stripLanguageTags(rawTitle)
+            if (baseTitle.isBlank()) return@forEach
+            val year = YEAR_REGEX.find(subject["releaseDate"]?.str.orEmpty())?.value.orEmpty()
+            val seasonCount = subject["seNum"]?.jsonPrimitive?.intOrNull ?: 0
+            val key = "${titleKey(baseTitle)}|$year|$seasonCount"
+            groups.getOrPut(key) { mutableListOf() }.add(
+                SubjectCard(
+                    subject = subject,
+                    id = id,
+                    baseTitle = baseTitle,
+                    languages = languagesOf(subject, rawTitle),
+                    hasLanguageTag = rawTitle != baseTitle,
+                ),
+            )
+        }
+
+        // Open the untagged subject: its details page carries the dubs of the
+        // other cards too, and the audio list is ordered separately.
+        val cardGroups = groups.values.map { cards ->
+            (cards.firstOrNull { !it.hasLanguageTag } ?: cards.first()) to cards
+        }
+        // Details carry the dubs that never show up as separate cards (Avatar
+        // lists Tamil, Telugu, Latin Spanish and Brazilian Portuguese there),
+        // so each card is enriched before its title is built.
+        val dubLanguages = fetchDubLanguages(cardGroups.map { (card, _) -> card.id })
+        val animes = cardGroups.mapNotNull { (card, cards) ->
+            val orderedCards = cards.sortedBy { if (it.hasLanguageTag) 1 else 0 }
+            val languages = orderLanguages(
+                (orderedCards.flatMap { it.languages } + dubLanguages[card.id].orEmpty()).distinct(),
+                priority,
+            )
+            val subject = card.subject
             val rating = subject["imdbRatingValue"]?.str ?: ""
             val corner = subject["corner"]?.str ?: ""
             SAnime.create().apply {
-                title = subject["title"]?.str ?: ""
-                url = "/movies/$id"
+                title = withLanguageTags(card.baseTitle, languages)
+                url = "/movies/${card.id}"
                 thumbnail_url = subject["cover"]?.obj?.get("url")?.str
                 status = if (rating.isNotBlank()) SAnime.COMPLETED else SAnime.UNKNOWN
                 author = if (corner.isNotBlank()) "[$corner] $rating" else rating
@@ -768,6 +854,152 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
                 nextPage > currentPage
             )
         return AnimesPage(animes, hasMore)
+    }
+
+    /** One per-language card returned by the list endpoints. */
+    private data class SubjectCard(
+        val subject: JsonObject,
+        val id: String,
+        val baseTitle: String,
+        val languages: List<String>,
+        val hasLanguageTag: Boolean,
+    )
+
+    private fun languagesOf(subject: JsonObject, rawTitle: String): List<String> {
+        val tagged = extractLanguageTags(rawTitle)
+        val declared = splitLanguageList(subject["language"]?.str.orEmpty()) +
+            splitLanguageList(subject["corner"]?.str.orEmpty())
+        return (tagged + declared).distinct()
+    }
+
+    /** Audio languages from a details response, including every dub track. */
+    private fun dubLanguageNames(subject: JsonObject): List<String> {
+        val names = mutableListOf<String>()
+        splitLanguageList(subject["language"]?.str.orEmpty()).forEach { names.add(it) }
+        subject["dubs"]?.arr?.forEach { dub ->
+            val raw = dub.obj?.get("lanName")?.str ?: return@forEach
+            // The dubs array also carries subtitle-only entries.
+            if (raw.trim().lowercase().endsWith("sub")) return@forEach
+            val cleaned = cleanLanguageToken(raw)
+            if (isLanguageName(cleaned)) names.add(canonicalLanguage(cleaned))
+        }
+        return names.distinct()
+    }
+
+    private fun fetchDubLanguagesFor(subjectId: String): List<String> {
+        dubLanguagesCache[subjectId]?.let { return it }
+        val path = "/wefeed-mobile-bff/subject-api/get?subjectId=$subjectId"
+        val jsonRes = safeGetJsonWithHeaders(path, isDetails = true)?.first ?: return emptyList()
+        val data = jsonRes.obj?.get("data")?.obj ?: return emptyList()
+        val subject = data["subject"]?.obj ?: data
+        return dubLanguageNames(subject).also { dubLanguagesCache[subjectId] = it }
+    }
+
+    /**
+     * Fetches the detail dubs of one page in parallel; a slow host must not
+     * hold the whole page hostage, so each future has a short timeout.
+     */
+    private fun fetchDubLanguages(subjectIds: List<String>): Map<String, List<String>> {
+        val ids = subjectIds.filter { it.isNotBlank() }.distinct()
+        if (dubLanguagesCache.size > 1000) dubLanguagesCache.clear()
+        val pending = ids.filter { !dubLanguagesCache.containsKey(it) }
+        if (pending.isNotEmpty()) {
+            val executor = java.util.concurrent.Executors.newFixedThreadPool(minOf(8, pending.size))
+            try {
+                val futures = pending.map { id ->
+                    executor.submit(java.util.concurrent.Callable { fetchDubLanguagesFor(id) })
+                }
+                futures.forEach { future ->
+                    runCatching { future.get(10, java.util.concurrent.TimeUnit.SECONDS) }
+                }
+            } finally {
+                executor.shutdownNow()
+            }
+        }
+        return ids.associateWith { dubLanguagesCache[it].orEmpty() }
+    }
+
+    private fun titleKey(title: String): String = title.lowercase().replace(Regex("""\s+"""), " ").trim()
+
+    private fun extractLanguageTags(title: String): List<String> =
+        BRACKET_TAG_REGEX.findAll(title)
+            .flatMap { match -> bracketLanguages(match.groupValues[1]).asSequence() }
+            .toList()
+
+    private fun bracketLanguages(raw: String): List<String> {
+        val tokens = raw.split(",", "/", "&", "|").map { cleanLanguageToken(it) }
+        if (tokens.isEmpty() || tokens.any { !isLanguageName(it) }) return emptyList()
+        return tokens.filter { it.isNotEmpty() }.map { canonicalLanguage(it) }
+    }
+
+    private fun splitLanguageList(raw: String): List<String> =
+        raw.split(",", "/", "&", "|")
+            .map { cleanLanguageToken(it) }
+            .filter { isLanguageName(it) }
+            .map { canonicalLanguage(it) }
+
+    private fun cleanLanguageToken(value: String): String =
+        value.trim().replace(
+            Regex("""\s*(?:\(\s*)?(?:dub|dubbed|sub|subbed)(?:\s*\))?$""", RegexOption.IGNORE_CASE),
+            "",
+        ).trim()
+
+    private fun isLanguageName(value: String): Boolean = value.trim().lowercase() in KNOWN_LANGUAGES
+
+    private fun canonicalLanguage(value: String): String =
+        when (val name = value.trim().lowercase()) {
+            "esla" -> "Spanish (LatAm)"
+            "ptbr" -> "Portuguese (Brazil)"
+            "ukr" -> "Ukrainian"
+            else -> name.replaceFirstChar { it.uppercase() }
+        }
+
+    /** Removes the "[Hindi]" style tags so the entry page shows a clean title. */
+    private fun stripLanguageTags(title: String): String {
+        val stripped = BRACKET_TAG_REGEX.replace(title) { match ->
+            if (bracketLanguages(match.groupValues[1]).isNotEmpty()) "" else match.value
+        }
+        return stripped.replace(Regex("""\s{2,}"""), " ").trim()
+    }
+
+    /** Puts the "[English, Hindi]" tag in front of a trailing season range. */
+    private fun withLanguageTags(title: String, languages: List<String>): String {
+        if (languages.isEmpty()) return title
+        val tag = "[${languages.joinToString(", ")}]"
+        val season = SEASON_SUFFIX_REGEX.find(title) ?: return "$title $tag"
+        if (season.range.first == 0) return "$title $tag"
+        return title.substring(0, season.range.first).trimEnd() + " $tag " + title.substring(season.range.first)
+    }
+
+    private fun orderLanguages(languages: List<String>, priority: List<String>): List<String> =
+        languages.sortedBy { languageRank(it, priority) }
+
+    private fun languageRank(language: String, priority: List<String>): Int {
+        val name = language.trim().lowercase()
+        if (name.isEmpty()) return priority.size + 1
+        val index = priority.indexOfFirst { name == it || name.startsWith("$it ") || name.contains(it) }
+        return if (index >= 0) index else priority.size + 1
+    }
+
+    private fun preferredLanguages(): List<String> =
+        preferences.getString(PREF_LANGUAGE_PRIORITY_KEY, null)
+            .orEmpty()
+            .split(",")
+            .map { it.trim().lowercase() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+
+    private fun parseLanguagePriority(value: String?): List<String> =
+        value.orEmpty()
+            .split(",", ";", "/")
+            .map { cleanLanguageToken(it).lowercase() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+
+    private fun languagePrioritySummary(order: List<String>): String = if (order.isEmpty()) {
+        "Not set - the original audio is listed first"
+    } else {
+        order.joinToString(", ") { it.replaceFirstChar { c -> c.uppercase() } }
     }
 
     private val JsonElement?.obj get() = this as? JsonObject
@@ -816,6 +1048,27 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
             setDefaultValue(PREF_AUDIO_DEFAULT)
             summary = "%s"
         }.also { screen.addPreference(it) }
+
+        val languagePriority = EditTextPreference(screen.context).apply {
+            key = PREF_LANGUAGE_PRIORITY_KEY
+            title = "Language priority"
+            dialogTitle = "Language priority"
+            dialogMessage = "Comma separated, first is listed first, for example hindi, english, tamil. " +
+                "Cards show every audio language a title has, the per-language posters MovieBox " +
+                "returns are merged into one card, and the first available language is listed " +
+                "first in the video list."
+            setDefaultValue("")
+            summary = languagePrioritySummary(preferredLanguages())
+        }
+        languagePriority.setOnPreferenceChangeListener { preference, value ->
+            val order = parseLanguagePriority(value as? String)
+            preferences.edit().putString(PREF_LANGUAGE_PRIORITY_KEY, order.joinToString(", ")).apply()
+            (preference as EditTextPreference).summary = languagePrioritySummary(order)
+            // The cleaned list is stored above, so the framework must not also
+            // store the raw text.
+            false
+        }
+        screen.addPreference(languagePriority)
 
         SwitchPreferenceCompat(screen.context).apply {
             key = "pref_show_thumbnails"
@@ -944,6 +1197,17 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
     }
 
     companion object {
+        private val YEAR_REGEX = Regex("""\b(?:19|20)\d{2}\b""")
+
+        // Stable for the process so a bearer token can always be used with the
+        // device id it was issued for; a new id per source instance would make
+        // the token invalid the moment the source is recreated.
+        private val deviceId by lazy {
+            val bytes = ByteArray(16)
+            SecureRandom().nextBytes(bytes)
+            bytes.joinToString("") { "%02x".format(it) }
+        }
+
         private const val PREF_HOST_KEY = "api_host"
 
         private const val PREF_QUALITY_KEY = "preferred_quality"
@@ -957,6 +1221,23 @@ class MovieBox : ConfigurableAnimeSource, AnimeHttpSource() {
         private const val PREF_AUDIO_DEFAULT = "English"
         private val PREF_AUDIO_ENTRIES = arrayOf("English", "Original", "Original Audio", "Japanese", "Hindi", "Telugu", "Tamil", "Portuguese (Brazil)", "Tagalog")
         private val PREF_AUDIO_VALUES = arrayOf("English", "Original", "Original Audio", "Japanese", "Hindi", "Telugu", "Tamil", "ptbr", "Tagalog")
+
+        private const val PREF_LANGUAGE_PRIORITY_KEY = "preferred_languages"
+
+        /** Audio languages MovieBox names in titles, corners and the language field. */
+        private val KNOWN_LANGUAGES = setOf(
+            "arabic", "bangla", "bengali", "burmese", "cantonese", "chinese", "czech", "dutch",
+            "english", "esla", "filipino", "french", "german", "greek", "hebrew", "hindi",
+            "hungarian", "indonesian", "italian", "japanese", "kannada", "korean", "kurdish",
+            "malay", "malayalam", "mandarin", "nepali", "persian", "polish", "portuguese",
+            "ptbr", "punjabi", "romanian", "russian", "sinhala", "spanish", "spanishlatam",
+            "swahili", "tagalog", "tamil", "telugu", "thai", "turkish", "ukr", "ukrainian",
+            "urdu", "vietnamese", "zulu",
+        )
+
+        private val BRACKET_TAG_REGEX = Regex("""\s*\[([^\]]+)]""")
+        private val SEASON_SUFFIX_REGEX = Regex("""\bS\d+(?:\s*[-\u2013]\s*S\d+)?\s*$""")
+        private val RESOLUTION_REGEX = Regex("""^\s*(\d{3,4})""")
 
         private var bearerToken: String? = null
 
