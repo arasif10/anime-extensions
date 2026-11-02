@@ -21,10 +21,10 @@
   {
     "name": "MovieBox (𝕬𝕽)",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.moviebox",
-    "apk": "aniyomi-all.moviebox-v14.23-release.apk",
+    "apk": "aniyomi-all.moviebox-v14.25-release.apk",
     "lang": "all",
-    "code": 23,
-    "version": "14.23",
+    "code": 25,
+    "version": "14.25",
     "nsfw": 0,
     "hasReadme": 0,
     "hasChangelog": 0,
